@@ -157,6 +157,13 @@ namespace wxl::scripts::equipextension
     // the raw-memory lookup is only a fallback for entries not listed here.
     static std::unordered_map<uint32_t, uint32_t> g_sidecarItemDisplay;
 
+    // Optional ItemDisplayInfo displayId -> model folder override, from WXLItemEntryDisplay.csv's
+    // optional third column (e.g. "Weapon", "Shield"). Consulted by PatchWeaponModelByDisplayId
+    // ahead of its own Weapon/Shield guesses -- see that function and LoadItemDisplaySidecarFile's
+    // doc comments. Keyed by displayId (not itemEntry): the folder is a property of the model file
+    // a displayId points at, so two itemEntries sharing a displayId share its folder too.
+    static std::unordered_map<uint32_t, std::string> g_sidecarModelFolder;
+
     // ItemDisplayInfo displayId -> virtual model path per column (0=Model1, 1=Model2), populated by
     // PatchWeaponModelByDisplayId right after a successful VPathPopulateGlobal registration. Consumed
     // by EquipExtension::OnItemDisplayLookup (subscribed to GameHooks' OnItemDisplayLookup) to
@@ -207,8 +214,8 @@ namespace wxl::scripts::equipextension
         { "Cape",     12,  12, false, false }, // 9  BACK
         { "Tabard",   34,  34, false, false }, // 10 TABARD
         { "Weapon",    1,   1, false, false }, // 11 MAINHAND (HandRight_ItemVisual1)
-        { "Weapon",    2,   2, false, false }, // 12 OFFHAND  (HandLeft_ItemVisual2, also shields)
-        { "Weapon",    3,   4, false, false }, // 13 RANGED   (bow/gun=3, quiver/ammo=4)
+        { "OffHand",    2,   2, false, false }, // 12 OFFHAND  (HandLeft_ItemVisual2, also shields)
+        { "Ranged",    3,   4, false, false }, // 13 RANGED   (bow/gun=3, quiver/ammo=4)
     };
     constexpr uint32_t kCollectionAttach = 19;
     constexpr uint32_t kFlagForceModelRaceGender = 0x80;
@@ -254,18 +261,6 @@ namespace wxl::scripts::equipextension
         }();
         return enabled != 0;
     }
-
-
-
-
-
-
-
-
-
-
-
-
 
     // Verbose equip diagnostics are opt-in. They touch very hot model/skin/per-frame paths, and opening
     // + flushing the log for every line can dominate frame time on HD-equipment-heavy scenes.
@@ -1206,8 +1201,15 @@ namespace wxl::scripts::equipextension
             EquipLog("material sidecar loaded '%s' rows=%u", path, loaded);
     }
 
-    // WXLItemEntryDisplay.csv columns: ItemEntry, DisplayID. Both required; malformed or duplicate
-    // rows for the same ItemEntry keep the first value seen and log the collision.
+    // WXLItemEntryDisplay.csv columns: ItemEntry, DisplayID, Folder (optional). ItemEntry/DisplayID
+    // are both required; malformed or duplicate rows for the same ItemEntry keep the first value
+    // seen and log the collision. Folder is the model's real Item\ObjectComponents\<Folder>\
+    // subdirectory (e.g. "Weapon", "Shield") -- when given, PatchWeaponModelByDisplayId tries it
+    // before falling back to its own Weapon/Shield guesses, so a mapper who already knows a
+    // display's folder (shields especially, since they don't live under \Weapon\ like everything
+    // else this sidecar is normally used for) can just say so instead of relying on the guess
+    // succeeding. Blank/missing Folder cells, or an entirely absent column (older two-column
+    // sidecar files keep working unchanged), just skip straight to those guesses.
     static void LoadItemDisplaySidecarFile(const char* path)
     {
         std::vector<std::string> lines;
@@ -1217,13 +1219,14 @@ namespace wxl::scripts::equipextension
         const int cEntry = FindCsvColumn(header, "ItemEntry");
         int cDisplay = FindCsvColumn(header, "DisplayID");
         if (cDisplay < 0) cDisplay = FindCsvColumn(header, "DisplayId");
+        const int cFolder = FindCsvColumn(header, "Folder");
         if (cEntry < 0 || cDisplay < 0)
         {
             EquipLog("item-display sidecar '%s': missing ItemEntry or DisplayID column", path);
             return;
         }
 
-        uint32_t loaded = 0;
+        uint32_t loaded = 0, loadedFolders = 0;
         for (size_t lineIndex = 1; lineIndex < lines.size(); ++lineIndex)
         {
             if (lines[lineIndex].empty()) continue;
@@ -1240,10 +1243,29 @@ namespace wxl::scripts::equipextension
                 continue;
             }
             ++loaded;
+
+            if (cFolder >= 0)
+            {
+                const char* folder = CsvField(row, cFolder);
+                if (folder && *folder)
+                {
+                    auto fins = g_sidecarModelFolder.emplace(displayId, folder);
+                    if (!fins.second && fins.first->second != folder)
+                    {
+                        EquipLog("item-display sidecar '%s': displayId=%u already has folder '%s', "
+                                 "ignoring conflicting row folder '%s'", path, displayId,
+                                 fins.first->second.c_str(), folder);
+                    }
+                    else if (fins.second)
+                    {
+                        ++loadedFolders;
+                    }
+                }
+            }
         }
 
         if (loaded)
-            EquipLog("item-display sidecar loaded '%s' rows=%u", path, loaded);
+            EquipLog("item-display sidecar loaded '%s' rows=%u (folders=%u)", path, loaded, loadedFolders);
     }
 
     // Forward decl: full definition sits near OnWeaponVisualChange (needs PatchWeaponModelByDisplayId,
@@ -2068,7 +2090,24 @@ static void BuildMaterialPatchSpecWeaponFallback(char* out, size_t outSz,
             if (!genderStr) genderStr = "";
         }
 
-        static const SlotConfig& wcfg = kSlotConfig[11]; // folder is "Weapon" for slots 11/12/13 alike
+        // Sidecar Folder column (WXLItemEntryDisplay.csv) takes priority when given for this
+        // displayId -- see LoadItemDisplaySidecarFile's doc comment -- but still falls back to the
+        // Weapon/Shield guesses below if it's missing, blank, or turns out not to be readable, so a
+        // stale/incorrect sidecar folder degrades gracefully instead of hard-failing the model.
+        const char* folderCandidates[3];
+        uint32_t folderCandidateCount = 0;
+        {
+            auto folderIt = g_sidecarModelFolder.find(displayId);
+            if (folderIt != g_sidecarModelFolder.end() && !folderIt->second.empty())
+                folderCandidates[folderCandidateCount++] = folderIt->second.c_str();
+            for (const char* def : { "Weapon", "Shield" })
+            {
+                bool dup = false;
+                for (uint32_t i = 0; i < folderCandidateCount; ++i)
+                    if (_stricmp(folderCandidates[i], def) == 0) { dup = true; break; }
+                if (!dup) folderCandidates[folderCandidateCount++] = def;
+            }
+        }
 
         auto patchWeaponModel = [&](const char* modelName, const char* texName, uint32_t modelColumn)
         {
@@ -2093,80 +2132,103 @@ static void BuildMaterialPatchSpecWeaponFallback(char* out, size_t outSz,
                 return;
             }
 
-            char modelPath[264];
-            BuildSlotPath(modelPath, stem, raceCode, genderStr, pathFlags, wcfg.folder, false,
-                          customFolder[0] ? customFolder : nullptr);
-
-            // Base ModelTexture_N -- baked directly into the model's own texture-unit table
-            // (OBJECT_SKIN promoted to HARDCODED, same as VPathPopulate does for a freshly-attached
-            // armor piece) rather than bound at runtime. Vanilla 3.3.5a only auto-binds
-            // ModelTexture_1/2 natively for Head/Shoulder; for weapons nothing else does it, which
-            // is why an otherwise-correctly-resolved weapon renders with a blank/white texture.
-            // Baking it into the served bytes means the very first load already has the right
-            // texture -- no per-frame render-context matching or BindTexSlot call needed.
-            // WEAPON_BLADE records are never touched by this bake -- only an explicit sidecar
-            // TextureType=3 row (see LoadMaterialSidecarFile) can hardcode one; a weapon with an
-            // unclaimed WEAPON_BLADE slot renders blank until that row exists, by design.
-            char texPath[264] = {};
-            if (texName && *texName)
-                BuildTexPath(texPath, sizeof(texPath), texName, raceCode, genderStr,
-                             pathFlags, wcfg.folder, false,
-                             customFolder[0] ? customFolder : nullptr, stem);
-
-            // Sidecar material patch (WXLItemDisplayModelMaterials.csv) -- extra layers beyond
-            // ModelTexture_1/2 (glow, tint, edgefade...). Independent of texPath above; either or
-            // both can be empty and VPathPopulateGlobal just skips whichever step has nothing to do.
-            char matTexSpec[2048] = {};
-            BuildMaterialPatchSpecWeaponFallback(matTexSpec, sizeof(matTexSpec), displayId, modelColumn, 0, stem,
-                                   raceCode, genderStr, wcfg.folder, false,
-                                   customFolder[0] ? customFolder : nullptr, stem);
-            if (!matTexSpec[0])
-                EquipLog("  weapon patch: model=%u '%s' -- no material sidecar rows", modelColumn, stem);
-
-            if (!texPath[0] && !matTexSpec[0])
+            for (uint32_t fi = 0; fi < folderCandidateCount; ++fi)
             {
-                EquipLog("  weapon patch: model=%u '%s' -- nothing to bake (no ModelTexture_N, "
-                         "no material sidecar rows)", modelColumn, stem);
-                return;
+                const char* folder = folderCandidates[fi];
+                char modelPath[264];
+                BuildSlotPath(modelPath, stem, raceCode, genderStr, pathFlags, folder, false,
+                              customFolder[0] ? customFolder : nullptr);
+
+                // Base ModelTexture_N -- baked directly into the model's own texture-unit table
+                // (OBJECT_SKIN promoted to HARDCODED, same as VPathPopulate does for a freshly-attached
+                // armor piece) rather than bound at runtime. Vanilla 3.3.5a only auto-binds
+                // ModelTexture_1/2 natively for Head/Shoulder; for weapons/shields nothing else does
+                // it, which is why an otherwise-correctly-resolved weapon/shield renders with a
+                // blank/white texture. Baking it into the served bytes means the very first load
+                // already has the right texture -- no per-frame render-context matching or BindTexSlot
+                // call needed. WEAPON_BLADE records are never touched by this bake -- only an explicit
+                // sidecar TextureType=3 row (see LoadMaterialSidecarFile) can hardcode one; a
+                // weapon/shield with an unclaimed WEAPON_BLADE slot renders blank until that row
+                // exists, by design.
+                char texPath[264] = {};
+                if (texName && *texName)
+                    BuildTexPath(texPath, sizeof(texPath), texName, raceCode, genderStr,
+                                 pathFlags, folder, false,
+                                 customFolder[0] ? customFolder : nullptr, stem);
+
+                // Sidecar material patch (WXLItemDisplayModelMaterials.csv) -- extra layers beyond
+                // ModelTexture_1/2 (glow, tint, edgefade...). Independent of texPath above; either or
+                // both can be empty and VPathPopulateGlobal just skips whichever step has nothing to do.
+                char matTexSpec[2048] = {};
+                BuildMaterialPatchSpecWeaponFallback(matTexSpec, sizeof(matTexSpec), displayId, modelColumn, 0, stem,
+                                       raceCode, genderStr, folder, false,
+                                       customFolder[0] ? customFolder : nullptr, stem);
+                if (!matTexSpec[0])
+                    EquipLog("  weapon patch: model=%u '%s' folder='%s' -- no material sidecar rows",
+                             modelColumn, stem, folder);
+
+                if (!texPath[0] && !matTexSpec[0])
+                {
+                    EquipLog("  weapon patch: model=%u '%s' folder='%s' -- nothing to bake (no "
+                             "ModelTexture_N, no material sidecar rows)", modelColumn, stem, folder);
+                    continue; // a different folder's sidecar rows could still match; keep trying
+                }
+
+                // VPathPopulateGlobal is a no-op (returns true, doesn't re-register) if this exact
+                // (path, displayId) pair was already registered by an earlier call -- e.g.
+                // PreregisterSidecarWeapons() already did this at startup, and this is a later
+                // reactive call for the same displayId. Cheap and safe to call from both the eager
+                // and reactive paths without tracking which one won. It also returns false if the real
+                // file can't be read under this folder -- expected for every candidate that isn't the
+                // right one, not just an I/O fluke, so a miss here just means "try the next folder",
+                // not "give up". The bytes are now keyed by a virtual path (modelPath mangled with
+                // displayId, returned in vModelPath below) rather than modelPath itself, so distinct
+                // displayIds sharing modelPath no longer clobber each other's patch -- but nothing will
+                // intercept a load of modelPath unmodified any more; whatever ultimately resolves the
+                // weapon's model needs to be pointed at vModelPath instead.
+                char vModelPath[280] = {};
+                bool registered = VPathPopulateGlobal(modelPath, displayId, texPath[0] ? texPath : nullptr,
+                                                       matTexSpec[0] ? matTexSpec : nullptr,
+                                                       vModelPath, sizeof(vModelPath));
+                EquipLog("  weapon patch: model=%u path='%s' vpath='%s' tex='%s' spec='%s' registered=%d",
+                         modelColumn, modelPath, vModelPath, texPath, matTexSpec, registered ? 1 : 0);
+
+                if (!registered)
+                    continue; // wrong folder for this displayId -- try the next candidate
+
+                // Only publish the substitution once the bytes are actually behind vModelPath -- a
+                // failed registration must not redirect ItemDisplayInfo at a path nothing will ever
+                // serve. modelColumn is 0 (Model1) or 1 (Model2), matching WeaponVPathOverride::vModel's
+                // index.
+                //
+                // IMPORTANT: Model1/Model2 for WEAPONS AND SHIELDS hold a bare filename natively
+                // (unlike Head/Shoulder/etc., whose native fields are already full archive paths) --
+                // the client's own loader prepends "Item\ObjectComponents\<folder>\" itself before
+                // opening the file, using whichever folder actually matches the item (Weapon vs
+                // Shield) -- not necessarily the one we tried first. vModelPath is the FULL virtual
+                // path under the folder that just proved correct (needed as-is for the
+                // VPathPopulateGlobal/g_globalOverrides key, which matches what the client requests
+                // *after* re-adding that same prefix), so only the basename goes into the DB row --
+                // writing the full path here made the client double up the directory and miss the
+                // override entirely (rendered as the default missing-model cube).
+                if (vModelPath[0] && modelColumn < 2)
+                {
+                    const char* base = vModelPath;
+                    for (const char* p = vModelPath; *p; ++p)
+                        if (*p == '\\' || *p == '/') base = p + 1;
+                    g_weaponVPaths[displayId].vModel[modelColumn] = base;
+                }
+                return; // found the right folder for this model -- done
             }
 
-            // VPathPopulateGlobal is a no-op (returns true, doesn't re-register) if this exact
-            // (path, displayId) pair was already registered by an earlier call -- e.g.
-            // PreregisterSidecarWeapons() already did this at startup, and this is a later
-            // reactive call for the same displayId. Cheap and safe to call from both the eager
-            // and reactive paths without tracking which one won. The bytes are now keyed by a
-            // virtual path (modelPath mangled with displayId, returned in vModelPath below) rather
-            // than modelPath itself, so distinct displayIds sharing modelPath no longer clobber
-            // each other's patch -- but nothing will intercept a load of modelPath unmodified any
-            // more; whatever ultimately resolves the weapon's model needs to be pointed at
-            // vModelPath instead.
-            char vModelPath[280] = {};
-            bool registered = VPathPopulateGlobal(modelPath, displayId, texPath[0] ? texPath : nullptr,
-                                                   matTexSpec[0] ? matTexSpec : nullptr,
-                                                   vModelPath, sizeof(vModelPath));
-            EquipLog("  weapon patch: model=%u path='%s' vpath='%s' tex='%s' spec='%s' registered=%d",
-                     modelColumn, modelPath, vModelPath, texPath, matTexSpec, registered ? 1 : 0);
-
-            // Only publish the substitution once the bytes are actually behind vModelPath -- a
-            // failed registration (e.g. ReadGameFile miss) must not redirect ItemDisplayInfo at a
-            // path nothing will ever serve. modelColumn is 0 (Model1) or 1 (Model2), matching
-            // WeaponVPathOverride::vModel's index.
-            //
-            // IMPORTANT: Model1/Model2 for WEAPONS hold a bare filename natively (unlike Head/
-            // Shoulder/etc., whose native fields are already full archive paths) -- the client's
-            // own weapon loader prepends "Item\ObjectComponents\<folder>\" itself before opening
-            // the file. vModelPath is the FULL virtual path (needed as-is for the
-            // VPathPopulateGlobal/g_globalOverrides key, which matches what the client requests
-            // *after* re-adding that prefix), so only the basename goes into the DB row -- writing
-            // the full path here made the client double up the directory and miss the override
-            // entirely (rendered as the default missing-model cube).
-            if (registered && vModelPath[0] && modelColumn < 2)
+            char triedFolders[128] = {};
+            for (uint32_t fi = 0; fi < folderCandidateCount; ++fi)
             {
-                const char* base = vModelPath;
-                for (const char* p = vModelPath; *p; ++p)
-                    if (*p == '\\' || *p == '/') base = p + 1;
-                g_weaponVPaths[displayId].vModel[modelColumn] = base;
+                if (fi) std::strncat(triedFolders, ", ", sizeof(triedFolders) - std::strlen(triedFolders) - 1);
+                std::strncat(triedFolders, folderCandidates[fi], sizeof(triedFolders) - std::strlen(triedFolders) - 1);
             }
+            EquipLog("  weapon patch: model=%u '%s' -- not found under any candidate folder (%s)",
+                     modelColumn, stem, triedFolders);
         };
 
         patchWeaponModel(modelName1, texName1, 0);
