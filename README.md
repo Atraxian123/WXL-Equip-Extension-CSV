@@ -9,6 +9,18 @@ A [WarcraftXL](https://github.com/WarcraftXL/WarcraftXL) module that dramaticall
 - **WarcraftXL** installed in the WoW 3.3.5a client directory (`d3d9.dll` proxy + `WarcraftXL.dll`).
 - This module is compiled into `WarcraftXL.dll` automatically — no separate DLL, no additional files needed at runtime.
 
+NOTE: this specific module uses an event implemented in this branch of the WXL-Core, at the moment pending Pulling from the main branch.
+https://github.com/Atraxian123/wxl-core
+
+---
+## Credits
+
+https://github.com/Morfium-G
+For the original wxl-equipextension module
+
+https://github.com/Furioz420
+For the .original .csv implementation
+
 ---
 
 ## Building
@@ -253,3 +265,57 @@ typedef enum<uint32> {
     AT_Unk_60                       = 60,
 } ATTACHMENT_ID;
 ```
+----
+
+## Texture Names Reference
+
+Textures in models have a known enumerator, if you for example are using WoW Blender Studio to edit models you would have surely noticed that changeable textures come with different names instead of a numeric type, those names point to an enumerator and the .csv sidecar cares about that enumerator Texturee.
+
+|Texture Name | Texture Type |Texture Name | Texture Type |
+|-------------|--------------|-------------|--------------|
+|Hardcoded|0|Monster 3|13|
+|Skin|1|Item Icon|14|
+|Object Skin|2|Guild Background Color|15|
+|Weapon Blade|3|Guild Emblem Color|16|
+|Weapon Handle|4|Guild Border Color|17|
+|Environment|5|Guild Emblem|18|
+|Hair|6|Eyes|19|
+|Facial Hair|7|Accessory|20|
+|Skin Extra|8|Secondary Skin|21|
+|UI Skin|9|Secondary Hair|22|
+|Tauren Mane|10|Unknown 23|23|
+|Monster 1|11|Unknown 24|24|
+|Monster 2|12|-|-|
+
+Ths repository has been tested with ulatek weapons that have Object Skin, Weapon Blade, Weapon Handle and Unknown 24 changeable textures.
+
+---
+
+## Geoset Names Reference
+
+Like textures, also geosets in models have a known name attached to an enumerator. This table will save you the headache of figuring out what enumerator corresponds to what name. You can then associate the geoset number with the geoset name. Woe.export uses geoset names instead of geoset numbers, for example, but the .dbc edits will use the geoset number.
+
+|Geoset Name|Geoset Number|Geoset Name|Geoset Number|Geoset Name|Geoset Number|
+|-----------|-------------|-----------|-------------|-----------|-------------|
+|Skin|0|Eye Effect|17xx|Necklace|36xx|
+|Hair|1xx|Belt|18xx|Headdress|37xx|
+|Facial 1|1xx|Bone/Trail|19xx|Tails|38xx|
+|Facial 2|2xx|Feet|20xx|MiscAccessory|39xx|
+|Facial 3|3xx|BE_NE_Hands/HandAttach|23xx|MiscFeature|40xx|
+|Glove|4xx|Horns/HeadAttach|24xx|Noses|41xx|
+|Boots|5xx|Head/DHBlindfolds|25xx|HairDecoration|42xx|
+|Shirt|6xx|Torso|22xx|HornDecoration|43xx|
+|Ears|7xx|Shoulders|26xx|BodySize|44xx|
+|Wristbands|8xx|Helmet|27xx|Unknown1|45xx|
+|Kneepads|9xx|ArmUpper|28xx|Unknown2|46xx|
+|Chest|10xx|ArmsReplace/MechagnomeArms|29xx|Unknown3|47xx|
+|Pants|11xx|LegsReplace/MechagnomeLegs|30xx|Unknown4|48xx|
+|Tabard|12xx|FeetReplace/MechagnomeFeet|31xx|Unknown5|49xx|
+|Trousers|13xx|HeadSwap|32xx|Unknown6|50xx|
+|Loincloth|14xx|Eyes|33xx|EyeGlows|51xx|
+|Cape|15xx|Eyebrows|34xx|-|-|
+|Facialjewelry|16xx|Piercing/Earring|35xx|-|-|
+
+In short, if you are looking at a collections model in Wow.Expor and you see a model with a Chest1 geoset, that geoset corresponds to 1001 or HandAttach3 that geoset corresponds to 2303
+
+---
