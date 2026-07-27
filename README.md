@@ -162,6 +162,7 @@ Sidecar used to declare weapon item IDs and their Display IDs, it was necessary 
 |--------|---------|
 | `ItemID` | Item Id matching the entry in the .dbc |
 | `DisplayID` | Item Display Id matching the entry in the .dbc |
+| `Folder` | Folder where the model is, either Weapon, Shield or Collections in rare cases when someone put fist weapons there in the listfile |
 
 ---
 
