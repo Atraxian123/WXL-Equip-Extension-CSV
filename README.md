@@ -1,15 +1,26 @@
-# wxl-equip-extension
+# wxl-equip-extension-csv
 
 A [WarcraftXL](https://github.com/WarcraftXL/WarcraftXL) module that dramatically expands what `ItemDisplayInfo.dbc` can do. It extends M2 model attachment support to every equippable slot, adds a second model channel to all slots, and introduces collection M2 support with per-geoset filtering — all driven entirely by DBC data, with no client code changes per item.
+Uses .csv sidecars to declare the extra textures newer models have.
+---
+
+## Personal Notes
+
+This was a personal project that branched off the main equip extension in order to allow players (me in particular) to use custom models for armors/weapons and/or custom texture variations and still have the funcionality for the extra textures those models may rquire.
+Since the original equip extensions at the time was not working for weapons and the db2 powered version is quite hard to use for injecting new models with multiple changeable textures, this side branch was born.
+
+This is mainly aimed at people who want to implement custom models in an easy way. 
+If you are interested only in running the retail stuff in your client, then the base module or the db2 module are the better choice.
+
+Needless to say, this is NOT compatible with withe either the base module or the DB2 one, so you have to choose which one to build your WarcraftXL with.
 
 ---
 
 ## Requirements
-
 - **WarcraftXL** installed in the WoW 3.3.5a client directory (`d3d9.dll` proxy + `WarcraftXL.dll`).
 - This module is compiled into `WarcraftXL.dll` automatically — no separate DLL, no additional files needed at runtime.
 
-NOTE: this specific module uses an event implemented in this branch of the WXL-Core, at the moment pending Pulling from the main branch.
+**NOTE: this specific module uses an event implemented in this branch of the WXL-Core, at the moment pending Pulling from the main branch.**
 https://github.com/Atraxian123/wxl-core
 
 ---
@@ -19,7 +30,7 @@ https://github.com/Morfium-G
 For the original wxl-equipextension module
 
 https://github.com/Furioz420
-For the .original .csv implementation
+For the original .csv implementation
 
 ---
 
