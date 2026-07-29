@@ -22,6 +22,8 @@ Needless to say, this is NOT compatible with withe either the base module or the
 
 **NOTE: this specific module uses an event implemented in this branch of the WXL-Core, at the moment pending Pulling from the main branch.**
 https://github.com/Atraxian123/wxl-core
+**This fork of the modern assets module that solves an issue with WEAPON_BLADE textures on non weapon items**
+https://github.com/Atraxian123/wxl-modern-assets
 
 ---
 ## Credits
