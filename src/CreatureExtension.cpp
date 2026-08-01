@@ -43,6 +43,25 @@ namespace wxl::scripts::creatureextension
     namespace ev  = wxl::events;
     namespace db2 = wxl::offsets::game::db2;
 
+    // ─── SEH helpers (duplicated from EquipExtension.cpp — same "small and self-contained enough
+    // to duplicate rather than share a header" reasoning as the CSV helpers below) ───────────────
+
+    static uint32_t GuardedReadU32(const void* ptr) noexcept
+    {
+        uint32_t v = 0;
+        __try { v = *static_cast<const uint32_t*>(ptr); }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
+        return v;
+    }
+
+    static void* GuardedReadPtr(const void* addr) noexcept
+    {
+        void* v = nullptr;
+        __try { v = *static_cast<void* const*>(addr); }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
+        return v;
+    }
+
     // ─── Logging ────────────────────────────────────────────────────────────────
     // Same opt-in-file-log shape as EquipExtension's EquipLog/EquipLogEnabled, kept separate (own
     // env var, own log file) so enabling one doesn't spam the other feature's log.
@@ -355,9 +374,122 @@ namespace wxl::scripts::creatureextension
         }
     }
 
+    // ─── Native displayId -> ModelName resolution (for eager preregistration) ────────────────────
+    // Replicates the two-hop inline lookup chain kResolveFn performs at kCaptureDisplayId /
+    // kResolveMerge, but as a standalone callable -- needed because that lookup isn't a real
+    // function, just inline code inside kResolveFn, so there's nothing to call directly.
+    //
+    // Both CreatureDisplayInfo and CreatureModelData are documented in DB2.hpp as "record* table,
+    // indexed by (id - minId)" -- the same pointer-array-of-records convention chrraces uses (see
+    // EquipExtension.cpp's ChrRaces walk), NOT the flat/contiguous convention db2::item uses. So
+    // kIdTable here holds a pointer to an array of record pointers, not an array of inline records.
+    static const char* CreatureModelNameForDisplayId(uint32_t displayId)
+    {
+        // Hop 1: CreatureDisplayInfo, displayId -> ModelID
+        int32_t minId = static_cast<int32_t>(GuardedReadU32(reinterpret_cast<void*>(db2::creaturedisplayinfo::kMinId)));
+        int32_t maxId = static_cast<int32_t>(GuardedReadU32(reinterpret_cast<void*>(db2::creaturedisplayinfo::kMaxId)));
+        if (static_cast<int32_t>(displayId) < minId || static_cast<int32_t>(displayId) > maxId)
+        {
+            CreatureLog("  CreatureModelNameForDisplayId: display=%u out of range [%d,%d]",
+                        displayId, minId, maxId);
+            return nullptr;
+        }
+
+        uint8_t* idTable = static_cast<uint8_t*>(
+            GuardedReadPtr(reinterpret_cast<void*>(db2::creaturedisplayinfo::kIdTable)));
+        if (!idTable) return nullptr;
+
+        void* cdiRec = GuardedReadPtr(idTable + (displayId - static_cast<uint32_t>(minId)) * sizeof(void*));
+        if (!cdiRec)
+        {
+            CreatureLog("  CreatureModelNameForDisplayId: display=%u -- no CreatureDisplayInfo row "
+                        "(sparse table, valid gap)", displayId);
+            return nullptr;
+        }
+
+        uint32_t modelId = GuardedReadU32(
+            reinterpret_cast<uint8_t*>(cdiRec) + db2::creaturedisplayinfo::kOffModelId);
+
+        // Hop 2: CreatureModelData, ModelID -> ModelName
+        int32_t mMin = static_cast<int32_t>(GuardedReadU32(reinterpret_cast<void*>(db2::creaturemodeldata::kMinId)));
+        int32_t mMax = static_cast<int32_t>(GuardedReadU32(reinterpret_cast<void*>(db2::creaturemodeldata::kMaxId)));
+        if (static_cast<int32_t>(modelId) < mMin || static_cast<int32_t>(modelId) > mMax)
+        {
+            CreatureLog("  CreatureModelNameForDisplayId: display=%u modelId=%u out of range [%d,%d]",
+                        displayId, modelId, mMin, mMax);
+            return nullptr;
+        }
+
+        uint8_t* mIdTable = static_cast<uint8_t*>(
+            GuardedReadPtr(reinterpret_cast<void*>(db2::creaturemodeldata::kIdTable)));
+        if (!mIdTable) return nullptr;
+
+        void* cmdRec = GuardedReadPtr(mIdTable + (modelId - static_cast<uint32_t>(mMin)) * sizeof(void*));
+        if (!cmdRec) return nullptr;
+
+        // Self-check against the confirmed layout (row+0 == its own ModelId) before trusting
+        // kOffModelName -- catches a stale patch/build indexing mismatch instead of silently
+        // baking a garbage path.
+        uint32_t selfId = GuardedReadU32(reinterpret_cast<uint8_t*>(cmdRec) + db2::creaturemodeldata::kOffId);
+        if (selfId != modelId)
+        {
+            CreatureLog("  CreatureModelNameForDisplayId: display=%u modelId=%u SELF-CHECK MISMATCH "
+                        "record[0]=%u -- skipping", displayId, modelId, selfId);
+            return nullptr;
+        }
+
+        const char* modelName = *reinterpret_cast<const char* const*>(
+            reinterpret_cast<uint8_t*>(cmdRec) + db2::creaturemodeldata::kOffModelName);
+        CreatureLog("  CreatureModelNameForDisplayId: display=%u modelId=%u -> '%s'",
+                    displayId, modelId, modelName ? modelName : "(null)");
+        return modelName;
+    }
+
+    // Walks every displayId known at sidecar-load time (WXLCreatureTextures.csv) and registers its
+    // baked-texture patch immediately, before any creature -- including one already spawned/visible
+    // the moment this module loads -- has a chance to resolve its model natively first.
+    //
+    // Why this exists: VPathPopulateGlobal is explicitly process-lifetime and path-keyed, not tied
+    // to any particular event firing (see its doc comment in VirtualPath.hpp), so it was always
+    // meant to support being populated ahead of time rather than only reactively -- same rationale
+    // as EquipExtension's PreregisterSidecarWeapons for weapons losing the race against the
+    // char-select preview load. Here the race is against whatever creature resolves its model first
+    // (e.g. one already in view on zone-in), which can happen before OnCreatureModelResolve's
+    // reactive registration would otherwise catch it.
+    static void PreregisterSidecarCreatures()
+    {
+        LoadCreatureSidecar(); // no-op after the first call
+        if (g_sidecarCreatureTextures.empty()) return;
+
+        CreatureLog("creature preregister: patching %zu sidecar-known display(s) ahead of first spawn",
+                    g_sidecarCreatureTextures.size());
+
+        for (const auto& [displayId, rows] : g_sidecarCreatureTextures)
+        {
+            char matSpec[2048] = {};
+            BuildCreatureMaterialPatchSpec(matSpec, sizeof(matSpec), displayId);
+            if (!matSpec[0]) continue;
+
+            const char* realModelName = CreatureModelNameForDisplayId(displayId);
+            if (!realModelName || !*realModelName) continue;
+
+            // No texPath (only materialPatchSpec) -- same as the reactive path in
+            // OnCreatureModelResolve; creature texture rows are all TextureType-keyed.
+            char vModelPath[280] = {};
+            bool registered = VPathPopulateGlobal(realModelName, displayId, nullptr, matSpec,
+                                                   vModelPath, sizeof(vModelPath));
+            CreatureLog("  preregister: display=%u real='%s' vpath='%s' spec='%s' registered=%d",
+                        displayId, realModelName, vModelPath, matSpec, registered ? 1 : 0);
+            if (!registered || !vModelPath[0]) continue;
+
+            g_creatureVPaths[displayId] = vModelPath;
+        }
+    }
+
     CreatureExtension::CreatureExtension()
     {
         on<&CreatureExtension::OnCreatureModelResolve>(ev::Event::OnCreatureModelResolve);
+        PreregisterSidecarCreatures();
     }
 
     // Fires for every CreatureModelData row the client resolves (see OnCreatureModelResolve's doc
