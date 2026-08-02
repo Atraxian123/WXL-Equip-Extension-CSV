@@ -43,25 +43,6 @@ namespace wxl::scripts::creatureextension
     namespace ev  = wxl::events;
     namespace db2 = wxl::offsets::game::db2;
 
-    // ─── SEH helpers (duplicated from EquipExtension.cpp — same "small and self-contained enough
-    // to duplicate rather than share a header" reasoning as the CSV helpers below) ───────────────
-
-    static uint32_t GuardedReadU32(const void* ptr) noexcept
-    {
-        uint32_t v = 0;
-        __try { v = *static_cast<const uint32_t*>(ptr); }
-        __except (EXCEPTION_EXECUTE_HANDLER) {}
-        return v;
-    }
-
-    static void* GuardedReadPtr(const void* addr) noexcept
-    {
-        void* v = nullptr;
-        __try { v = *static_cast<void* const*>(addr); }
-        __except (EXCEPTION_EXECUTE_HANDLER) {}
-        return v;
-    }
-
     // ─── Logging ────────────────────────────────────────────────────────────────
     // Same opt-in-file-log shape as EquipExtension's EquipLog/EquipLogEnabled, kept separate (own
     // env var, own log file) so enabling one doesn't spam the other feature's log.
@@ -258,6 +239,20 @@ namespace wxl::scripts::creatureextension
     static bool g_sidecarLoaded = false;
     static std::unordered_map<uint32_t, std::vector<SidecarCreatureTextureEntry>> g_sidecarCreatureTextures;
 
+    // WXLCreatureModels.csv columns: DisplayID, CreatureModelPath. One row per DisplayID --
+    // CreatureModelPath is the real archive path of the .mdx that displayId natively resolves to
+    // (author-supplied, e.g. pulled from a DBC/SQL dump), same "known-good pair, no in-memory
+    // guesswork" convention as EquipExtension's WXLItemEntryDisplay.csv. This is what makes eager
+    // preregistration possible for creatures: without it, the only way to learn a displayId's real
+    // model path is the native CreatureDisplayInfo -> CreatureModelData lookup chain, which isn't a
+    // real callable function (see DB2.hpp's kCaptureDisplayId/kResolveMerge comments) -- walking its
+    // id tables by hand at module-load time is fragile against whatever state the client's own DB2
+    // storage happens to be in that early, and empirically has taken the client down outright rather
+    // than failing safely inside the __try/__except guards. Only displayIds listed in this file are
+    // eligible for eager preregistration; anything else still falls back to the existing reactive
+    // path in OnCreatureModelResolve, same as before this file existed.
+    static std::unordered_map<uint32_t, std::string> g_sidecarCreatureModelPath;
+
     // displayId -> baked virtual model path, process-lifetime once registered (same convention as
     // VirtualPath.cpp's g_globalOverrides / EquipExtension's g_weaponVPaths). Owns the string bytes
     // ModelName gets pointed at, since OnCreatureModelResolveMergeCaptured only hands us a stack
@@ -316,6 +311,54 @@ namespace wxl::scripts::creatureextension
             CreatureLog("creature texture sidecar loaded '%s' rows=%u", path, loaded);
     }
 
+    static void LoadCreatureModelPathSidecarFile(const char* path)
+    {
+        std::vector<std::string> lines;
+        if (!ReadSidecarLines(path, lines)) return;
+
+        const std::vector<std::string> header = ParseCsvLine(lines[0].c_str());
+        const int cDisplay = FindCsvColumn(header, "DisplayID");
+        const int cModel   = FindCsvColumn(header, "CreatureModelPath");
+
+        if (cDisplay < 0 || cModel < 0)
+        {
+            CreatureLog("creature model-path sidecar '%s': missing DisplayID or CreatureModelPath "
+                        "column", path);
+            return;
+        }
+
+        uint32_t loaded = 0;
+        for (size_t lineIndex = 1; lineIndex < lines.size(); ++lineIndex)
+        {
+            if (lines[lineIndex].empty()) continue;
+            const std::vector<std::string> row = ParseCsvLine(lines[lineIndex].c_str());
+
+            uint32_t displayId = 0;
+            if (!ParseU32(CsvField(row, cDisplay), &displayId) || displayId == 0) continue;
+
+            char modelPath[264];
+            CopyString(modelPath, sizeof(modelPath), CsvField(row, cModel));
+            if (!modelPath[0]) continue;
+
+            // First-seen wins, same dedup convention as the texture sidecar -- guards against the
+            // same physical CSV being reachable (and therefore re-parsed) via more than one of
+            // LoadCreatureSidecar's search paths.
+            if (g_sidecarCreatureModelPath.find(displayId) != g_sidecarCreatureModelPath.end())
+                continue;
+
+            g_sidecarCreatureModelPath.emplace(displayId, modelPath);
+            ++loaded;
+        }
+
+        if (loaded)
+            CreatureLog("creature model-path sidecar loaded '%s' rows=%u", path, loaded);
+    }
+
+    // Forward decl: full definition sits after BuildCreatureMaterialPatchSpec (needs it), but must
+    // be called from the end of LoadCreatureSidecar below -- same shape as EquipExtension's
+    // LoadSidecarModels calling PreregisterSidecarWeapons at its own end.
+    static void PreregisterSidecarCreatures();
+
     // Same search pattern as EquipExtension's LoadSidecarModels: bare filename, DBFilesClient\
     // beside it, and DBFilesClient\ inside every mounted Data\*.MPQ directory (patch overrides).
     static void LoadCreatureSidecar()
@@ -325,6 +368,8 @@ namespace wxl::scripts::creatureextension
 
         LoadCreatureTextureSidecarFile("WXLCreatureTextures.csv");
         LoadCreatureTextureSidecarFile("DBFilesClient\\WXLCreatureTextures.csv");
+        LoadCreatureModelPathSidecarFile("WXLCreatureModels.csv");
+        LoadCreatureModelPathSidecarFile("DBFilesClient\\WXLCreatureModels.csv");
 
         WIN32_FIND_DATAA fd = {};
         HANDLE h = FindFirstFileA("Data\\*.MPQ", &fd);
@@ -333,16 +378,28 @@ namespace wxl::scripts::creatureextension
             do
             {
                 if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
-                std::string path = "Data\\";
-                path += fd.cFileName;
-                path += "\\DBFilesClient\\WXLCreatureTextures.csv";
-                LoadCreatureTextureSidecarFile(path.c_str());
+                std::string base = "Data\\";
+                base += fd.cFileName;
+                base += "\\DBFilesClient\\";
+                LoadCreatureTextureSidecarFile((base + "WXLCreatureTextures.csv").c_str());
+                LoadCreatureModelPathSidecarFile((base + "WXLCreatureModels.csv").c_str());
             }
             while (FindNextFileA(h, &fd));
             FindClose(h);
         }
 
-        CreatureLog("creature sidecar table ready: displays=%zu", g_sidecarCreatureTextures.size());
+        CreatureLog("creature sidecar table ready: displays=%zu textures, %zu model-paths",
+                    g_sidecarCreatureTextures.size(), g_sidecarCreatureModelPath.size());
+
+        // Deliberately called here, at the end of the CSV load, NOT from CreatureExtension's
+        // constructor. The constructor runs on the file-scope global at DLL static-init time
+        // (DllMain/DLL_PROCESS_ATTACH) -- before the client's own engine subsystems (archive
+        // mounting, file I/O) are guaranteed to be up. LoadCreatureSidecar, by contrast, only ever
+        // runs lazily, the first time OnCreatureModelResolve actually fires for a real creature --
+        // i.e. only once the client is already deep into a live game session. Same reasoning as
+        // EquipExtension: PreregisterSidecarWeapons is called from the end of LoadSidecarModels,
+        // not from EquipExtension's constructor, for the same static-init-timing reason.
+        PreregisterSidecarCreatures();
     }
 
     // Builds a "TextureType=TexturePath|TextureType=TexturePath|..." spec for displayId, in the
@@ -374,80 +431,10 @@ namespace wxl::scripts::creatureextension
         }
     }
 
-    // ─── Native displayId -> ModelName resolution (for eager preregistration) ────────────────────
-    // Replicates the two-hop inline lookup chain kResolveFn performs at kCaptureDisplayId /
-    // kResolveMerge, but as a standalone callable -- needed because that lookup isn't a real
-    // function, just inline code inside kResolveFn, so there's nothing to call directly.
-    //
-    // Both CreatureDisplayInfo and CreatureModelData are documented in DB2.hpp as "record* table,
-    // indexed by (id - minId)" -- the same pointer-array-of-records convention chrraces uses (see
-    // EquipExtension.cpp's ChrRaces walk), NOT the flat/contiguous convention db2::item uses. So
-    // kIdTable here holds a pointer to an array of record pointers, not an array of inline records.
-    static const char* CreatureModelNameForDisplayId(uint32_t displayId)
-    {
-        // Hop 1: CreatureDisplayInfo, displayId -> ModelID
-        int32_t minId = static_cast<int32_t>(GuardedReadU32(reinterpret_cast<void*>(db2::creaturedisplayinfo::kMinId)));
-        int32_t maxId = static_cast<int32_t>(GuardedReadU32(reinterpret_cast<void*>(db2::creaturedisplayinfo::kMaxId)));
-        if (static_cast<int32_t>(displayId) < minId || static_cast<int32_t>(displayId) > maxId)
-        {
-            CreatureLog("  CreatureModelNameForDisplayId: display=%u out of range [%d,%d]",
-                        displayId, minId, maxId);
-            return nullptr;
-        }
-
-        uint8_t* idTable = static_cast<uint8_t*>(
-            GuardedReadPtr(reinterpret_cast<void*>(db2::creaturedisplayinfo::kIdTable)));
-        if (!idTable) return nullptr;
-
-        void* cdiRec = GuardedReadPtr(idTable + (displayId - static_cast<uint32_t>(minId)) * sizeof(void*));
-        if (!cdiRec)
-        {
-            CreatureLog("  CreatureModelNameForDisplayId: display=%u -- no CreatureDisplayInfo row "
-                        "(sparse table, valid gap)", displayId);
-            return nullptr;
-        }
-
-        uint32_t modelId = GuardedReadU32(
-            reinterpret_cast<uint8_t*>(cdiRec) + db2::creaturedisplayinfo::kOffModelId);
-
-        // Hop 2: CreatureModelData, ModelID -> ModelName
-        int32_t mMin = static_cast<int32_t>(GuardedReadU32(reinterpret_cast<void*>(db2::creaturemodeldata::kMinId)));
-        int32_t mMax = static_cast<int32_t>(GuardedReadU32(reinterpret_cast<void*>(db2::creaturemodeldata::kMaxId)));
-        if (static_cast<int32_t>(modelId) < mMin || static_cast<int32_t>(modelId) > mMax)
-        {
-            CreatureLog("  CreatureModelNameForDisplayId: display=%u modelId=%u out of range [%d,%d]",
-                        displayId, modelId, mMin, mMax);
-            return nullptr;
-        }
-
-        uint8_t* mIdTable = static_cast<uint8_t*>(
-            GuardedReadPtr(reinterpret_cast<void*>(db2::creaturemodeldata::kIdTable)));
-        if (!mIdTable) return nullptr;
-
-        void* cmdRec = GuardedReadPtr(mIdTable + (modelId - static_cast<uint32_t>(mMin)) * sizeof(void*));
-        if (!cmdRec) return nullptr;
-
-        // Self-check against the confirmed layout (row+0 == its own ModelId) before trusting
-        // kOffModelName -- catches a stale patch/build indexing mismatch instead of silently
-        // baking a garbage path.
-        uint32_t selfId = GuardedReadU32(reinterpret_cast<uint8_t*>(cmdRec) + db2::creaturemodeldata::kOffId);
-        if (selfId != modelId)
-        {
-            CreatureLog("  CreatureModelNameForDisplayId: display=%u modelId=%u SELF-CHECK MISMATCH "
-                        "record[0]=%u -- skipping", displayId, modelId, selfId);
-            return nullptr;
-        }
-
-        const char* modelName = *reinterpret_cast<const char* const*>(
-            reinterpret_cast<uint8_t*>(cmdRec) + db2::creaturemodeldata::kOffModelName);
-        CreatureLog("  CreatureModelNameForDisplayId: display=%u modelId=%u -> '%s'",
-                    displayId, modelId, modelName ? modelName : "(null)");
-        return modelName;
-    }
-
-    // Walks every displayId known at sidecar-load time (WXLCreatureTextures.csv) and registers its
-    // baked-texture patch immediately, before any creature -- including one already spawned/visible
-    // the moment this module loads -- has a chance to resolve its model natively first.
+    // Walks every displayId listed in WXLCreatureModels.csv (with a matching WXLCreatureTextures.csv
+    // entry) and registers its baked-texture patch immediately, before any creature -- including
+    // one already spawned/visible the moment this module loads -- has a chance to resolve its model
+    // natively first.
     //
     // Why this exists: VPathPopulateGlobal is explicitly process-lifetime and path-keyed, not tied
     // to any particular event firing (see its doc comment in VirtualPath.hpp), so it was always
@@ -456,40 +443,85 @@ namespace wxl::scripts::creatureextension
     // char-select preview load. Here the race is against whatever creature resolves its model first
     // (e.g. one already in view on zone-in), which can happen before OnCreatureModelResolve's
     // reactive registration would otherwise catch it.
+    //
+    // Deliberately sidecar-only, unlike EquipExtension's weapon preregister: that one falls back to
+    // a native ItemDisplayInfo lookup (a real funnel function, ItemDisplayInfoLookupNative) when an
+    // itemEntry has no sidecar Folder override. Creatures have no equivalent safe native entry
+    // point -- CreatureDisplayInfo/CreatureModelData resolution is inlined into kResolveFn, not a
+    // callable function, and hand-walking those id tables directly at module-load time proved
+    // unsafe in practice. So only displayIds with an explicit WXLCreatureModels.csv row are eligible
+    // for eager registration; anything else still gets patched reactively, on first resolve, via
+    // OnCreatureModelResolve exactly as before.
     static void PreregisterSidecarCreatures()
     {
-        LoadCreatureSidecar(); // no-op after the first call
-        if (g_sidecarCreatureTextures.empty()) return;
+        // No LoadCreatureSidecar() call here -- this function is only ever invoked from the end of
+        // LoadCreatureSidecar itself (see its call site's comment), so the sidecar tables below are
+        // already guaranteed populated by the time we get here.
+        if (g_sidecarCreatureModelPath.empty()) return;
 
-        CreatureLog("creature preregister: patching %zu sidecar-known display(s) ahead of first spawn",
-                    g_sidecarCreatureTextures.size());
+        CreatureLog("creature preregister: %zu display(s) with a known model path, %zu with texture rows",
+                    g_sidecarCreatureModelPath.size(), g_sidecarCreatureTextures.size());
 
-        for (const auto& [displayId, rows] : g_sidecarCreatureTextures)
+        uint32_t registeredCount = 0;
+        for (const auto& [displayId, realModelPath] : g_sidecarCreatureModelPath)
         {
             char matSpec[2048] = {};
             BuildCreatureMaterialPatchSpec(matSpec, sizeof(matSpec), displayId);
-            if (!matSpec[0]) continue;
+            if (!matSpec[0])
+            {
+                // Model path known but no texture rows for this displayId -- nothing to bake, and
+                // OnCreatureModelResolve already skips displayIds with no g_sidecarCreatureTextures
+                // entry, so pre-registering here would just be a no-op VPathPopulateGlobal call.
+                continue;
+            }
 
-            const char* realModelName = CreatureModelNameForDisplayId(displayId);
-            if (!realModelName || !*realModelName) continue;
+            if (realModelPath.empty()) continue;
 
             // No texPath (only materialPatchSpec) -- same as the reactive path in
             // OnCreatureModelResolve; creature texture rows are all TextureType-keyed.
             char vModelPath[280] = {};
-            bool registered = VPathPopulateGlobal(realModelName, displayId, nullptr, matSpec,
+            bool registered = VPathPopulateGlobal(realModelPath.c_str(), displayId, nullptr, matSpec,
                                                    vModelPath, sizeof(vModelPath));
             CreatureLog("  preregister: display=%u real='%s' vpath='%s' spec='%s' registered=%d",
-                        displayId, realModelName, vModelPath, matSpec, registered ? 1 : 0);
+                        displayId, realModelPath.c_str(), vModelPath, matSpec, registered ? 1 : 0);
             if (!registered || !vModelPath[0]) continue;
 
             g_creatureVPaths[displayId] = vModelPath;
+            ++registeredCount;
         }
+
+        CreatureLog("creature preregister: done, %u display(s) registered ahead of first spawn",
+                    registeredCount);
     }
 
     CreatureExtension::CreatureExtension()
     {
+        // Deliberately does NOT call LoadCreatureSidecar/PreregisterSidecarCreatures here -- this
+        // constructor runs on the file-scope global at DLL static-init time (DllMain), before the
+        // client's own archive/file-I/O subsystems are guaranteed up.
         on<&CreatureExtension::OnCreatureModelResolve>(ev::Event::OnCreatureModelResolve);
-        PreregisterSidecarCreatures();
+        on<&CreatureExtension::OnItemSlotChange>(ev::Event::OnItemSlotChange);
+    }
+
+    // Not item/equip-related -- reused purely as an early, reliable trigger. OnItemSlotChange is
+    // confirmed to be the very first event in the entire log: it fires for the head slot before any
+    // weapon-specific event exists, well ahead of any full RebuildAllModels/OnM2SkinFinalize/
+    // PerFrame cycle. OnWeaponVisualChange was the previous choice here, but it doesn't actually fire
+    // until after that whole cycle has already run for the character's other equipment -- it was
+    // never as early as it looked. OnItemSlotChange is.
+    //
+    // This decoupling mirrors weapons directly: registration (PreregisterSidecarWeapons) and the
+    // actual native field substitution (OnItemDisplayLookup) are two SEPARATE hooks there, so
+    // registration finishing early costs nothing and helps every later lookup. Doing the same thing
+    // here -- kicking creature preload off an unrelated-but-early event -- gets creatures the same
+    // property: by the time any creature's OnCreatureModelResolve fires for real, the preload is
+    // long since finished and out of the way.
+    void CreatureExtension::OnItemSlotChange(const ev::ItemSlotChangeArgs&)
+    {
+        static bool kicked = false;
+        if (kicked) return;
+        kicked = true;
+        LoadCreatureSidecar(); // no-op after the first call; runs PreregisterSidecarCreatures at its end
     }
 
     // Fires for every CreatureModelData row the client resolves (see OnCreatureModelResolve's doc
@@ -515,6 +547,19 @@ namespace wxl::scripts::creatureextension
         }
 
         LoadCreatureSidecar(); // no-op after the first call
+
+        // Re-check: LoadCreatureSidecar (first call only) runs PreregisterSidecarCreatures at its
+        // end, which may have just registered and stashed THIS exact displayId. In the steady state
+        // (OnItemSlotChange already kicked the preload on an earlier, unrelated event) this is
+        // always a no-op second lookup -- cheap insurance, not the primary fix; the primary fix is
+        // that the preload no longer runs inside this call in the first place.
+        stashedIt = g_creatureVPaths.find(a.displayId);
+        if (stashedIt != g_creatureVPaths.end())
+        {
+            *reinterpret_cast<const char**>(static_cast<uint8_t*>(a.record) + db2::creaturemodeldata::kOffModelName)
+                = stashedIt->second.c_str();
+            return;
+        }
 
         auto it = g_sidecarCreatureTextures.find(a.displayId);
         if (it == g_sidecarCreatureTextures.end()) return; // nothing configured; leave ModelName untouched

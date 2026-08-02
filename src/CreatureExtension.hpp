@@ -26,5 +26,14 @@ namespace wxl::scripts::creatureextension
 
     private:
         void OnCreatureModelResolve(const wxl::events::CreatureModelResolveArgs& a);
+
+        // Not a creature-related handler at all -- used purely as a trigger to kick the one-time
+        // sidecar load + eager preload off as early as possible, decoupled from any specific
+        // creature's own resolve. OnItemSlotChange is the proven-early choice: it's confirmed to be
+        // the very first event in the log -- firing for the head slot before any weapon-specific
+        // event exists, ahead of any full RebuildAllModels/OnM2SkinFinalize/PerFrame cycle -- well
+        // before any creature could possibly need to resolve. No item/equip-related work happens
+        // here; the args are ignored.
+        void OnItemSlotChange(const wxl::events::ItemSlotChangeArgs& a);
     };
 }
