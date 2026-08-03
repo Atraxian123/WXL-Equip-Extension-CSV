@@ -38,6 +38,8 @@
 // as-is via its current namespace rather than doing an unrequested rename/move; worth revisiting as
 // a cleanup if a third consumer ever shows up and the naming gets more confusing still.
 using wxl::scripts::equipextension::VPathPopulateGlobal;
+using wxl::scripts::equipextension::VPathRegisterLazyResolver;
+using wxl::scripts::equipextension::VPathDecodeGlobalVirtualKey;
 
 namespace wxl::scripts::creatureextension
 {
@@ -348,6 +350,15 @@ namespace wxl::scripts::creatureextension
             CreatureLog("creature model-path sidecar loaded '%s' rows=%u", path, loaded);
     }
 
+    // Compile-time switch for eager creature preregistration (PreregisterSidecarCreatures, called
+    // from the end of LoadCreatureSidecar below) -- same role as EquipExtension's
+    // kEagerPreregisterWeapons. Lazy on-demand baking (see CreatureLazyResolve and its
+    // VPathRegisterLazyResolver registration in this file's constructor) covers the same ground
+    // reactively -- from a VirtualProvide miss instead of a startup sweep -- and runs unconditionally,
+    // independent of this flag. Flip to false to skip the startup sweep entirely and rely on lazy
+    // baking alone.
+    static constexpr bool kEagerPreregisterCreatures = true;
+
     // Forward decl: full definition sits after BuildCreatureMaterialPatchSpec (needs it), but must
     // be called from the end of LoadCreatureSidecar below -- same shape as EquipExtension's
     // LoadSidecarModels calling PreregisterSidecarWeapons at its own end.
@@ -394,7 +405,8 @@ namespace wxl::scripts::creatureextension
         // exists. Same reasoning as EquipExtension: PreregisterSidecarWeapons is called from the end
         // of LoadSidecarModels, not from EquipExtension's constructor, for the same
         // static-init-timing reason.
-        PreregisterSidecarCreatures();
+        if (kEagerPreregisterCreatures)
+            PreregisterSidecarCreatures();
     }
 
     // Builds a "TextureType=TexturePath|TextureType=TexturePath|..." spec for displayId, in the
@@ -426,6 +438,34 @@ namespace wxl::scripts::creatureextension
         }
     }
 
+    // Bakes displayId's patched bytes into the process-lifetime override table, if the sidecar tables
+    // know both a model path (WXLCreatureModels.csv) and at least one texture row
+    // (WXLCreatureTextures.csv) for it. Shared by both PreregisterSidecarCreatures (eager, walks every
+    // known displayId at startup) and CreatureLazyResolve (lazy, one displayId at a time, on demand)
+    // so the actual bake logic only exists once. Assumes the sidecar tables are already populated --
+    // callers are responsible for that (both current callers route through LoadCreatureSidecar first).
+    static bool BakeCreatureDisplay(uint32_t displayId)
+    {
+        auto pathIt = g_sidecarCreatureModelPath.find(displayId);
+        if (pathIt == g_sidecarCreatureModelPath.end() || pathIt->second.empty()) return false;
+
+        char matSpec[2048] = {};
+        BuildCreatureMaterialPatchSpec(matSpec, sizeof(matSpec), displayId);
+        if (!matSpec[0])
+        {
+            // Model path known but no texture rows for this displayId -- nothing to bake.
+            return false;
+        }
+
+        // No texPath (only materialPatchSpec) -- creature texture rows are all TextureType-keyed.
+        char vModelPath[280] = {};
+        bool registered = VPathPopulateGlobal(pathIt->second.c_str(), displayId, nullptr, matSpec,
+                                               vModelPath, sizeof(vModelPath));
+        CreatureLog("  bake: display=%u real='%s' vpath='%s' spec='%s' registered=%d",
+                    displayId, pathIt->second.c_str(), vModelPath, matSpec, registered ? 1 : 0);
+        return registered && vModelPath[0];
+    }
+
     // Walks every displayId listed in WXLCreatureModels.csv (with a matching WXLCreatureTextures.csv
     // entry) and bakes its patched bytes into the process-lifetime override table under the exact
     // virtual .m2 name CreatureModelData's ModelName field already names for that displayId (patched
@@ -449,29 +489,43 @@ namespace wxl::scripts::creatureextension
         uint32_t registeredCount = 0;
         for (const auto& [displayId, realModelPath] : g_sidecarCreatureModelPath)
         {
-            char matSpec[2048] = {};
-            BuildCreatureMaterialPatchSpec(matSpec, sizeof(matSpec), displayId);
-            if (!matSpec[0])
-            {
-                // Model path known but no texture rows for this displayId -- nothing to bake.
-                continue;
-            }
-
-            if (realModelPath.empty()) continue;
-
-            // No texPath (only materialPatchSpec) -- creature texture rows are all TextureType-keyed.
-            char vModelPath[280] = {};
-            bool registered = VPathPopulateGlobal(realModelPath.c_str(), displayId, nullptr, matSpec,
-                                                   vModelPath, sizeof(vModelPath));
-            CreatureLog("  preregister: display=%u real='%s' vpath='%s' spec='%s' registered=%d",
-                        displayId, realModelPath.c_str(), vModelPath, matSpec, registered ? 1 : 0);
-            if (!registered || !vModelPath[0]) continue;
-
-            ++registeredCount;
+            if (BakeCreatureDisplay(displayId)) ++registeredCount;
         }
 
         CreatureLog("creature preregister: done, %u display(s) registered ahead of first spawn",
                     registeredCount);
+    }
+
+    // Lazy on-demand counterpart to PreregisterSidecarCreatures, registered with VirtualPath.cpp via
+    // VPathRegisterLazyResolver and invoked from VirtualProvide on a g_globalOverrides miss. Runs
+    // unconditionally regardless of kEagerPreregisterCreatures -- with eager preload on, this is a
+    // safety net for any displayId that slips past the startup sweep; with it off, this is the only
+    // path that ever bakes a creature override at all.
+    //
+    // normVirtualPath is whatever VirtualProvide's own NormalizeRealPath produced from the raw
+    // loader request -- already lowercase with a .m2 extension, the form VPathDecodeGlobalVirtualKey
+    // expects. A successful decode only confirms the name has the right *shape* (see that function's
+    // doc comment); the decoded displayId is only trusted once it's confirmed present in
+    // g_sidecarCreatureModelPath -- the same table PreregisterSidecarCreatures itself walks -- and
+    // BakeCreatureDisplay re-derives everything it bakes from that table and
+    // g_sidecarCreatureTextures, not from the decoded path, so a coincidental decode of an unrelated
+    // real archive path can't smuggle in bytes for the wrong model.
+    static bool CreatureLazyResolve(const char* normVirtualPath)
+    {
+        LoadCreatureSidecar(); // no-op after the first call; must run before the sidecar tables are read
+
+        char decodedPath[264] = {};
+        uint32_t displayId = 0;
+        if (!VPathDecodeGlobalVirtualKey(
+                normVirtualPath, decodedPath, sizeof(decodedPath), &displayId))
+            return false;
+
+        if (g_sidecarCreatureModelPath.find(displayId) == g_sidecarCreatureModelPath.end())
+            return false; // not a displayId this module knows about
+
+        CreatureLog("  CreatureLazyResolve: miss '%s' decoded displayId=%u -- baking now",
+                    normVirtualPath, displayId);
+        return BakeCreatureDisplay(displayId);
     }
 
     CreatureExtension::CreatureExtension()
@@ -480,6 +534,12 @@ namespace wxl::scripts::creatureextension
         // constructor runs on the file-scope global at DLL static-init time (DllMain), before the
         // client's own archive/file-I/O subsystems are guaranteed up.
         on<&CreatureExtension::OnModelLoadPre>(ev::Event::OnModelLoadPre);
+
+        // Cheap (one vector push_back, no I/O) so it's safe here regardless of engine subsystem init
+        // order -- see VPathRegisterLazyResolver's doc comment in VirtualPath.hpp. Independent of
+        // kEagerPreregisterCreatures: registered either way, so lazy baking works whether or not eager
+        // preload is compiled in.
+        VPathRegisterLazyResolver(&CreatureLazyResolve);
     }
 
     // See the doc comment on the declaration in CreatureExtension.hpp for why OnModelLoadPre and not

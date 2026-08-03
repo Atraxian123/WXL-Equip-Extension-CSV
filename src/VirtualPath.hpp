@@ -119,4 +119,49 @@ namespace wxl::scripts::equipextension
     bool VPathPopulateGlobal(const char* realMdxPath, uint32_t itemDisplayId,
                              const char* texPath, const char* materialPatchSpec,
                              char* outVirtualPath = nullptr, size_t outVirtualPathSz = 0);
+
+    /**
+     * @brief Signature for a lazy-bake resolver registered via VPathRegisterLazyResolver.
+     *
+     * Invoked from VirtualProvide on a g_globalOverrides miss, with the already-normalized (lowercase,
+     * .m2-extension) virtual path name the loader just requested. A resolver should try to decode that
+     * name (see VPathDecodeGlobalVirtualKey) into a (real path, id) pair it recognizes, and if so, bake
+     * it right now via VPathPopulateGlobal and return true so VirtualProvide retries the lookup. Return
+     * false if this name doesn't decode to anything the resolver knows about -- the next resolver (if
+     * any) gets a turn.
+     */
+    using VPathLazyResolver = bool (*)(const char* normalizedVirtualPathName);
+
+    /**
+     * @brief Registers a lazy-bake resolver, tried in registration order on every global-override miss.
+     *
+     * This is what makes genuine on-demand baking possible: unlike the eager preregister path (which
+     * walks every sidecar-known id at startup), a resolver only ever does work for an id something
+     * actually just asked for. Intended to be called once, from each consumer's own static-init
+     * (mirrors RegisterClientProvider's shape in StorageHook.hpp) -- registering costs one vector
+     * push_back, no I/O, so it's safe there regardless of engine subsystem init order.
+     */
+    void VPathRegisterLazyResolver(VPathLazyResolver resolver);
+
+    /**
+     * @brief Inverts BuildGlobalVirtualKey: decodes a virtual path of the form "<stem>_<id><ext>" back
+     *        into its normalized real path ("<stem><ext>") and the id mangled into it.
+     *
+     * Finds the extension (text from the last '.'), then the run of ASCII digits immediately before
+     * it; if that digit run is itself immediately preceded by '_', the digits decode as outDisplayId
+     * and everything before that '_' plus the extension decodes as outNormPath. Returns false if the
+     * name doesn't have that shape (no '.', no digit run, or no '_' before it).
+     *
+     * This is a syntactic decode only -- it does NOT confirm outDisplayId is one the caller actually
+     * knows about, or that outNormPath is really the path that id's real model lives at. A real archive
+     * path that innocently happens to end in "_<digits>.m2" decodes "successfully" too. Callers (e.g. a
+     * VPathLazyResolver) must still check the decoded id against their own known-id table before
+     * treating the decode as authoritative.
+     * @param outNormPath    destination buffer for the decoded normalized real path
+     * @param outNormPathSz  size of outNormPath in bytes
+     * @param outDisplayId   destination for the decoded id
+     * @return true if virtualPathName had the "<stem>_<digits><ext>" shape and both outputs were written
+     */
+    bool VPathDecodeGlobalVirtualKey(const char* virtualPathName, char* outNormPath, size_t outNormPathSz,
+                                     uint32_t* outDisplayId);
 }

@@ -1268,6 +1268,15 @@ namespace wxl::scripts::equipextension
             EquipLog("item-display sidecar loaded '%s' rows=%u (folders=%u)", path, loaded, loadedFolders);
     }
 
+    // Compile-time switch for eager weapon preregistration (PreregisterSidecarWeapons, called from
+    // the end of LoadSidecarModels below). Lazy on-demand baking (see WeaponLazyResolve and its
+    // VPathRegisterLazyResolver registration near the bottom of this file) covers the same ground
+    // reactively -- from a VirtualProvide miss instead of a startup sweep -- and runs unconditionally,
+    // independent of this flag, so turning eager preload off does not lose functionality, only its
+    // ahead-of-time guarantee for whatever the char-select preview model happens to render first.
+    // Flip to false to skip the startup sweep entirely and rely on lazy baking alone.
+    static constexpr bool kEagerPreregisterWeapons = true;
+
     // Forward decl: full definition sits near OnWeaponVisualChange (needs PatchWeaponModelByDisplayId,
     // itself defined there), but LoadSidecarModels needs to call it as soon as the sidecar tables are
     // populated, and LoadSidecarModels is defined earlier in this file.
@@ -1312,7 +1321,8 @@ namespace wxl::scripts::equipextension
         EquipLog("sidecar table ready: displays=%zu materialDisplays=%zu itemEntryDisplays=%zu",
                  g_sidecarModels.size(), g_sidecarMaterials.size(), g_sidecarItemDisplay.size());
 
-        PreregisterSidecarWeapons();
+        if (kEagerPreregisterWeapons)
+            PreregisterSidecarWeapons();
     }
 
     // ─── Path builders ────────────────────────────────────────────────────────────
@@ -2261,6 +2271,49 @@ static void BuildMaterialPatchSpecWeaponFallback(char* out, size_t outSz,
                  g_sidecarItemDisplay.size());
         for (const auto& [itemEntry, displayId] : g_sidecarItemDisplay)
             PatchWeaponModelByDisplayId(displayId, itemEntry, nullptr);
+    }
+
+    // Lazy on-demand counterpart to PreregisterSidecarWeapons, registered with VirtualPath.cpp via
+    // VPathRegisterLazyResolver and invoked from VirtualProvide on a g_globalOverrides miss. Runs
+    // unconditionally regardless of kEagerPreregisterWeapons -- with eager preload on, this is a
+    // safety net for any displayId that slips past the startup sweep (e.g. a sidecar file that only
+    // becomes readable after some other MPQ mounts later); with it off, this is the only path that
+    // ever bakes a weapon override at all.
+    //
+    // normVirtualPath is whatever VirtualProvide's own NormalizeRealPath produced from the raw
+    // loader request, so it's already lowercase with a .m2 extension -- exactly the form
+    // VPathDecodeGlobalVirtualKey expects. Decoding it recovers a candidate displayId, but a decode
+    // succeeding only means the name has the right *shape* (see that function's doc comment); it says
+    // nothing about whether this is really one of ours. The displayId is only trusted once it's found
+    // among the values of g_sidecarItemDisplay -- i.e. some itemEntry actually maps to it -- the same
+    // set PreregisterSidecarWeapons itself walks.
+    static bool WeaponLazyResolve(const char* normVirtualPath)
+    {
+        LoadSidecarModels(); // no-op after the first call; must run before g_sidecarItemDisplay is read
+
+        char decodedPath[264] = {};
+        uint32_t displayId = 0;
+        if (!VPathDecodeGlobalVirtualKey(normVirtualPath, decodedPath, sizeof(decodedPath), &displayId))
+            return false;
+
+        uint32_t knownItemEntry = 0;
+        bool known = false;
+        for (const auto& [itemEntry, mappedDisplayId] : g_sidecarItemDisplay)
+        {
+            if (mappedDisplayId == displayId) { known = true; knownItemEntry = itemEntry; break; }
+        }
+        if (!known) return false;
+
+        EquipLog("  WeaponLazyResolve: miss '%s' decoded displayId=%u (itemEntry=%u) -- baking now",
+                 normVirtualPath, displayId, knownItemEntry);
+
+        // owner28 is nullptr here, same as the eager preregister call site -- a lazy miss on the
+        // global-override table happens no later than the char-select preview/first load, before any
+        // real character object exists for this displayId either. Forced race/gender weapon variants
+        // (Icon2 flag 0x80) still get patched later, reactively, on the wearer's first real equip --
+        // see PatchWeaponModelByDisplayId's own doc comment.
+        PatchWeaponModelByDisplayId(displayId, knownItemEntry, nullptr);
+        return true;
     }
 
     // ─── Event handler implementations ───────────────────────────────────────────
@@ -3265,6 +3318,12 @@ static void BuildMaterialPatchSpecWeaponFallback(char* out, size_t outSz,
         on<&EquipExtension::OnWeaponVisualChange>(ev::Event::OnWeaponVisualChange);
         on<&EquipExtension::OnItemDisplayLookup>(ev::Event::OnItemDisplayLookup);
         on<&EquipExtension::OnModelLoadPre>(ev::Event::OnModelLoadPre);
+
+        // Cheap (one vector push_back, no I/O) so it's safe here regardless of engine subsystem init
+        // order -- see VPathRegisterLazyResolver's doc comment in VirtualPath.hpp. Independent of
+        // kEagerPreregisterWeapons: registered either way, so lazy baking works whether or not eager
+        // preload is compiled in.
+        VPathRegisterLazyResolver(&WeaponLazyResolve);
     }
 
     // Self-registration: file-scope instance binds handlers at DLL load via EventScript ctor.
