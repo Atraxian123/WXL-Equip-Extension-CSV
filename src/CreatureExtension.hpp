@@ -25,22 +25,22 @@ namespace wxl::scripts::creatureextension
         CreatureExtension();
 
     private:
-        void OnCreatureModelResolve(const wxl::events::CreatureModelResolveArgs& a);
-
-        // Not a creature-related handler at all -- used purely as a trigger to kick the one-time
-        // sidecar load + eager preload off as early as possible, decoupled from any specific
-        // creature's own resolve. OnItemSlotChange is the proven-early choice: it's confirmed to be
-        // the very first event in the log -- firing for the head slot before any weapon-specific
-        // event exists, ahead of any full RebuildAllModels/OnM2SkinFinalize/PerFrame cycle -- well
-        // before any creature could possibly need to resolve. No item/equip-related work happens
-        // here; the args are ignored.
-        void OnItemSlotChange(const wxl::events::ItemSlotChangeArgs& a);
-
-        // TEMPORARY DIAGNOSTIC: logs pathStem/model/header/fileSize for every manawyrm2mount M2
-        // load, so we can see actual model LOADS (not just CreatureModelData resolves, which
-        // OnCreatureModelResolve already logs) -- specifically whether a mount summon or a repeat
-        // morph produces its own fresh load, or silently reuses an already-loaded resource without
-        // ever reaching this event. Remove once the mount/shared-model investigation concludes.
-        void OnModelLoad(const wxl::events::ModelLoadArgs& a);
+        // Not model-load-related at all -- reused purely as the earliest possible, unconditional
+        // trigger to kick the one-time sidecar load + eager preload off. OnModelLoadPre fires for
+        // ANY model init anywhere in the client (see hkM2Init in GameHooks.cpp), including the
+        // login/char-select glue scene's own preview models -- pets, mounts, and weapons can all
+        // render there, well before the client ever enters the actual game world. OnWorldEnter was
+        // the previous choice, but it wraps CWorldEnter specifically, which never fires until
+        // character select is already behind you -- too late for anything shown at the glue screen.
+        // Even a completely bare, unequipped character still has to load its own base body mesh to
+        // render at all, so this fires reliably regardless of gear, unlike OnItemSlotChange before
+        // it. This is now CreatureExtension's ONLY job: bake every sidecar-known displayId's virtual
+        // .m2 bytes into the process-lifetime override table ahead of time. There is no reactive
+        // per-resolve hook anymore -- CreatureModelData's ModelName field is patched at the data
+        // level (outside this module) to already name the correct per-displayId virtual path
+        // directly, so the native loader just asks for the right file on its own, every time, with
+        // no hook, no shared-row corruption risk, and no model-instance-cache collision between
+        // displayIds sharing one model file.
+        void OnModelLoadPre(const wxl::events::ModelLoadArgs& a);
     };
 }

@@ -42,8 +42,6 @@ using wxl::scripts::equipextension::VPathPopulateGlobal;
 namespace wxl::scripts::creatureextension
 {
     namespace ev  = wxl::events;
-    namespace db2 = wxl::offsets::game::db2;
-    namespace m2  = wxl::offsets::game::m2;
 
     // ─── Logging ────────────────────────────────────────────────────────────────
     // Same opt-in-file-log shape as EquipExtension's EquipLog/EquipLogEnabled, kept separate (own
@@ -251,15 +249,9 @@ namespace wxl::scripts::creatureextension
     // id tables by hand at module-load time is fragile against whatever state the client's own DB2
     // storage happens to be in that early, and empirically has taken the client down outright rather
     // than failing safely inside the __try/__except guards. Only displayIds listed in this file are
-    // eligible for eager preregistration; anything else still falls back to the existing reactive
-    // path in OnCreatureModelResolve, same as before this file existed.
+    // eligible for eager preregistration; anything else simply isn't patched (there is no reactive
+    // fallback anymore -- see OnModelLoadPre's doc comment for why).
     static std::unordered_map<uint32_t, std::string> g_sidecarCreatureModelPath;
-
-    // displayId -> baked virtual model path, process-lifetime once registered (same convention as
-    // VirtualPath.cpp's g_globalOverrides / EquipExtension's g_weaponVPaths). Owns the string bytes
-    // ModelName gets pointed at, since OnCreatureModelResolveMergeCaptured only hands us a stack
-    // buffer via VPathPopulateGlobal's outVirtualPath and that pointer must outlive this call.
-    static std::unordered_map<uint32_t, std::string> g_creatureVPaths;
 
     static void LoadCreatureTextureSidecarFile(const char* path)
     {
@@ -397,10 +389,11 @@ namespace wxl::scripts::creatureextension
         // constructor. The constructor runs on the file-scope global at DLL static-init time
         // (DllMain/DLL_PROCESS_ATTACH) -- before the client's own engine subsystems (archive
         // mounting, file I/O) are guaranteed to be up. LoadCreatureSidecar, by contrast, only ever
-        // runs lazily, the first time OnCreatureModelResolve actually fires for a real creature --
-        // i.e. only once the client is already deep into a live game session. Same reasoning as
-        // EquipExtension: PreregisterSidecarWeapons is called from the end of LoadSidecarModels,
-        // not from EquipExtension's constructor, for the same static-init-timing reason.
+        // runs lazily, the first time OnModelLoadPre fires -- i.e. as soon as anything at all is
+        // rendered, including the login/char-select glue scene, well before any world/gear state
+        // exists. Same reasoning as EquipExtension: PreregisterSidecarWeapons is called from the end
+        // of LoadSidecarModels, not from EquipExtension's constructor, for the same
+        // static-init-timing reason.
         PreregisterSidecarCreatures();
     }
 
@@ -434,26 +427,15 @@ namespace wxl::scripts::creatureextension
     }
 
     // Walks every displayId listed in WXLCreatureModels.csv (with a matching WXLCreatureTextures.csv
-    // entry) and registers its baked-texture patch immediately, before any creature -- including
-    // one already spawned/visible the moment this module loads -- has a chance to resolve its model
-    // natively first.
+    // entry) and bakes its patched bytes into the process-lifetime override table under the exact
+    // virtual .m2 name CreatureModelData's ModelName field already names for that displayId (patched
+    // at the data level, outside this module -- see OnModelLoadPre's doc comment). There is no
+    // race to lose here anymore: the native loader always asks for that virtual name directly, on
+    // every spawn/transform/relog, so this only needs to run once, sometime before the first such
+    // request -- it doesn't matter which creature asks first.
     //
-    // Why this exists: VPathPopulateGlobal is explicitly process-lifetime and path-keyed, not tied
-    // to any particular event firing (see its doc comment in VirtualPath.hpp), so it was always
-    // meant to support being populated ahead of time rather than only reactively -- same rationale
-    // as EquipExtension's PreregisterSidecarWeapons for weapons losing the race against the
-    // char-select preview load. Here the race is against whatever creature resolves its model first
-    // (e.g. one already in view on zone-in), which can happen before OnCreatureModelResolve's
-    // reactive registration would otherwise catch it.
-    //
-    // Deliberately sidecar-only, unlike EquipExtension's weapon preregister: that one falls back to
-    // a native ItemDisplayInfo lookup (a real funnel function, ItemDisplayInfoLookupNative) when an
-    // itemEntry has no sidecar Folder override. Creatures have no equivalent safe native entry
-    // point -- CreatureDisplayInfo/CreatureModelData resolution is inlined into kResolveFn, not a
-    // callable function, and hand-walking those id tables directly at module-load time proved
-    // unsafe in practice. So only displayIds with an explicit WXLCreatureModels.csv row are eligible
-    // for eager registration; anything else still gets patched reactively, on first resolve, via
-    // OnCreatureModelResolve exactly as before.
+    // Deliberately sidecar-only: only displayIds with an explicit WXLCreatureModels.csv row get
+    // baked. Anything else simply isn't patched -- there is no reactive fallback.
     static void PreregisterSidecarCreatures()
     {
         // No LoadCreatureSidecar() call here -- this function is only ever invoked from the end of
@@ -471,16 +453,13 @@ namespace wxl::scripts::creatureextension
             BuildCreatureMaterialPatchSpec(matSpec, sizeof(matSpec), displayId);
             if (!matSpec[0])
             {
-                // Model path known but no texture rows for this displayId -- nothing to bake, and
-                // OnCreatureModelResolve already skips displayIds with no g_sidecarCreatureTextures
-                // entry, so pre-registering here would just be a no-op VPathPopulateGlobal call.
+                // Model path known but no texture rows for this displayId -- nothing to bake.
                 continue;
             }
 
             if (realModelPath.empty()) continue;
 
-            // No texPath (only materialPatchSpec) -- same as the reactive path in
-            // OnCreatureModelResolve; creature texture rows are all TextureType-keyed.
+            // No texPath (only materialPatchSpec) -- creature texture rows are all TextureType-keyed.
             char vModelPath[280] = {};
             bool registered = VPathPopulateGlobal(realModelPath.c_str(), displayId, nullptr, matSpec,
                                                    vModelPath, sizeof(vModelPath));
@@ -488,7 +467,6 @@ namespace wxl::scripts::creatureextension
                         displayId, realModelPath.c_str(), vModelPath, matSpec, registered ? 1 : 0);
             if (!registered || !vModelPath[0]) continue;
 
-            g_creatureVPaths[displayId] = vModelPath;
             ++registeredCount;
         }
 
@@ -501,123 +479,17 @@ namespace wxl::scripts::creatureextension
         // Deliberately does NOT call LoadCreatureSidecar/PreregisterSidecarCreatures here -- this
         // constructor runs on the file-scope global at DLL static-init time (DllMain), before the
         // client's own archive/file-I/O subsystems are guaranteed up.
-        on<&CreatureExtension::OnCreatureModelResolve>(ev::Event::OnCreatureModelResolve);
-        on<&CreatureExtension::OnItemSlotChange>(ev::Event::OnItemSlotChange);
-        on<&CreatureExtension::OnModelLoad>(ev::Event::OnModelLoad); // TEMPORARY DIAGNOSTIC, see .hpp
+        on<&CreatureExtension::OnModelLoadPre>(ev::Event::OnModelLoadPre);
     }
 
-    // Not item/equip-related -- reused purely as an early, reliable trigger. OnItemSlotChange is
-    // confirmed to be the very first event in the entire log: it fires for the head slot before any
-    // weapon-specific event exists, well ahead of any full RebuildAllModels/OnM2SkinFinalize/
-    // PerFrame cycle. OnWeaponVisualChange was the previous choice here, but it doesn't actually fire
-    // until after that whole cycle has already run for the character's other equipment -- it was
-    // never as early as it looked. OnItemSlotChange is.
-    //
-    // This decoupling mirrors weapons directly: registration (PreregisterSidecarWeapons) and the
-    // actual native field substitution (OnItemDisplayLookup) are two SEPARATE hooks there, so
-    // registration finishing early costs nothing and helps every later lookup. Doing the same thing
-    // here -- kicking creature preload off an unrelated-but-early event -- gets creatures the same
-    // property: by the time any creature's OnCreatureModelResolve fires for real, the preload is
-    // long since finished and out of the way.
-    void CreatureExtension::OnItemSlotChange(const ev::ItemSlotChangeArgs&)
+    // See the doc comment on the declaration in CreatureExtension.hpp for why OnModelLoadPre and not
+    // OnWorldEnter/OnItemSlotChange.
+    void CreatureExtension::OnModelLoadPre(const ev::ModelLoadArgs&)
     {
         static bool kicked = false;
         if (kicked) return;
         kicked = true;
         LoadCreatureSidecar(); // no-op after the first call; runs PreregisterSidecarCreatures at its end
-    }
-
-    // Fires for every CreatureModelData row the client resolves (see OnCreatureModelResolve's doc
-    // comment in Event.hpp) -- covers every way a creature's model gets resolved, native model
-    // loader included, since GameHooks' hook sits inside the one confirmed choke point for this.
-    // displayId is the sidecar key (NOT modelId -- several displayIds commonly share one model, and
-    // each needs its own independently baked texture set; see CreatureModelResolveArgs's doc
-    // comment for why modelId can't do this job).
-    void CreatureExtension::OnCreatureModelResolve(const ev::CreatureModelResolveArgs& a)
-    {
-        if (!a.record || a.displayId == 0) return;
-
-        // Already baked and registered for this displayId in a prior call -- just re-point
-        // ModelName at the stashed, process-lifetime string and stop. The overwhelming majority of
-        // calls for a displayId with no sidecar entry at all never reach this map (see the sidecar
-        // lookup below), so this early hit only helps repeat resolves of displayIds we DO care about.
-        auto stashedIt = g_creatureVPaths.find(a.displayId);
-        if (stashedIt != g_creatureVPaths.end())
-        {
-            *reinterpret_cast<const char**>(static_cast<uint8_t*>(a.record) + db2::creaturemodeldata::kOffModelName)
-                = stashedIt->second.c_str();
-            CreatureLog("model resolve (cached): display=%u modelId=%u record=%p -> vpath='%s'",
-                        a.displayId, a.modelId, a.record, stashedIt->second.c_str());
-            return;
-        }
-
-        LoadCreatureSidecar(); // no-op after the first call
-
-        // Re-check: LoadCreatureSidecar (first call only) runs PreregisterSidecarCreatures at its
-        // end, which may have just registered and stashed THIS exact displayId. In the steady state
-        // (OnItemSlotChange already kicked the preload on an earlier, unrelated event) this is
-        // always a no-op second lookup -- cheap insurance, not the primary fix; the primary fix is
-        // that the preload no longer runs inside this call in the first place.
-        stashedIt = g_creatureVPaths.find(a.displayId);
-        if (stashedIt != g_creatureVPaths.end())
-        {
-            *reinterpret_cast<const char**>(static_cast<uint8_t*>(a.record) + db2::creaturemodeldata::kOffModelName)
-                = stashedIt->second.c_str();
-            CreatureLog("model resolve (cached, post-preload): display=%u modelId=%u record=%p -> vpath='%s'",
-                        a.displayId, a.modelId, a.record, stashedIt->second.c_str());
-            return;
-        }
-
-        auto it = g_sidecarCreatureTextures.find(a.displayId);
-        if (it == g_sidecarCreatureTextures.end()) return; // nothing configured; leave ModelName untouched
-
-        char matSpec[2048] = {};
-        BuildCreatureMaterialPatchSpec(matSpec, sizeof(matSpec), a.displayId);
-        if (!matSpec[0]) return;
-
-        const char* realModelName =
-            *reinterpret_cast<const char**>(static_cast<uint8_t*>(a.record) + db2::creaturemodeldata::kOffModelName);
-        if (!realModelName || !*realModelName) return;
-
-        // No texPath (only materialPatchSpec) -- creature texture rows are all TextureType-keyed,
-        // there's no separate "bake this one texture onto whatever OBJECT_SKIN slots are left"
-        // fallback the way weapons use texPath for ModelTexture_1/2. modelId is passed through only
-        // for logging; the virtual-path key itself is displayId, via VPathPopulateGlobal's own
-        // itemDisplayId parameter (generic despite the name -- see VirtualPath.hpp).
-        char vModelPath[280] = {};
-        bool registered = VPathPopulateGlobal(realModelName, a.displayId, nullptr, matSpec,
-                                               vModelPath, sizeof(vModelPath));
-        CreatureLog("model resolve: display=%u modelId=%u real='%s' vpath='%s' spec='%s' registered=%d",
-                    a.displayId, a.modelId, realModelName, vModelPath, matSpec, registered ? 1 : 0);
-        if (!registered || !vModelPath[0]) return;
-
-        auto& stashed = g_creatureVPaths[a.displayId];
-        stashed = vModelPath;
-        *reinterpret_cast<const char**>(static_cast<uint8_t*>(a.record) + db2::creaturemodeldata::kOffModelName)
-            = stashed.c_str();
-    }
-
-    // TEMPORARY DIAGNOSTIC (see the doc comment on the declaration in CreatureExtension.hpp).
-    //
-    // Filtered to manawyrm2mount so it doesn't flood the log with every unrelated model in the
-    // scene. pathStem/header/fileSize are read directly off the runtime M2Model object
-    // (offsets/game/M2.hpp), independent of anything OnCreatureModelResolve did or didn't write --
-    // this reflects what the engine actually LOADED, not what CreatureModelData's row currently
-    // says. Comparing this against the "model resolve (cached): ..." lines tells us whether a given
-    // visual change (e.g. a mount summon, or a repeat morph) corresponds to a fresh model load here,
-    // or whether the object just started rendering an already-loaded resource with no load event of
-    // its own -- the two have very different fixes.
-    void CreatureExtension::OnModelLoad(const ev::ModelLoadArgs& a)
-    {
-        if (!a.model) return;
-        const char* pathStem = reinterpret_cast<const char*>(
-            static_cast<uint8_t*>(a.model) + m2::kOffModelPathStem);
-        if (!pathStem[0] || !std::strstr(pathStem, "manawyrm2mount")) return;
-
-        void*    header = *reinterpret_cast<void**>(static_cast<uint8_t*>(a.model) + m2::kOffModelHeader);
-        uint32_t fileSz  = *reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(a.model) + m2::kOffModelFileSize);
-        CreatureLog("DIAG OnModelLoad: model=%p pathStem='%s' header=%p fileSize=%u",
-                    a.model, pathStem, header, fileSz);
     }
 
     // Self-registration: file-scope instance binds handlers at DLL load via EventScript ctor.

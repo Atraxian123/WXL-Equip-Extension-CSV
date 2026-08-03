@@ -2349,6 +2349,13 @@ static void BuildMaterialPatchSpecWeaponFallback(char* out, size_t outSz,
             *reinterpret_cast<const char**>(rec + db2::itemdisplayinfo::kOffModel2) = it->second.vModel[1].c_str();
     }
 
+    // See the doc comment on the declaration in EquipExtension.hpp for why this exists alongside
+    // the older OnItemSlotChange/OnWeaponVisualChange/LookupItemDisplayId trigger points.
+    void EquipExtension::OnModelLoadPre(const ev::ModelLoadArgs&)
+    {
+        LoadSidecarModels(); // no-op after the first call; runs PreregisterSidecarWeapons at its end
+    }
+
     void EquipExtension::OnItemSlotChange(const ev::ItemSlotChangeArgs& a)
     {
         if (a.modelSlot >= 14) return;
@@ -3257,6 +3264,7 @@ static void BuildMaterialPatchSpecWeaponFallback(char* out, size_t outSz,
         on<&EquipExtension::OnBuildBonePalette>(ev::Event::OnBuildBonePalette);
         on<&EquipExtension::OnWeaponVisualChange>(ev::Event::OnWeaponVisualChange);
         on<&EquipExtension::OnItemDisplayLookup>(ev::Event::OnItemDisplayLookup);
+        on<&EquipExtension::OnModelLoadPre>(ev::Event::OnModelLoadPre);
     }
 
     // Self-registration: file-scope instance binds handlers at DLL load via EventScript ctor.
