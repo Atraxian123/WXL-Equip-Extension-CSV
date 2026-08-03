@@ -239,10 +239,10 @@ namespace wxl::scripts::creatureextension
     static bool g_sidecarLoaded = false;
     static std::unordered_map<uint32_t, std::vector<SidecarCreatureTextureEntry>> g_sidecarCreatureTextures;
 
-    // WXLCreatureModels.csv columns: DisplayID, CreatureModelPath. One row per DisplayID --
-    // CreatureModelPath is the real archive path of the .mdx that displayId natively resolves to
-    // (author-supplied, e.g. pulled from a DBC/SQL dump), same "known-good pair, no in-memory
-    // guesswork" convention as EquipExtension's WXLItemEntryDisplay.csv. This is what makes eager
+    // WXLCreatureModels.csv columns: DisplayID, CreatureModelPath, Geoset (optional). One row per
+    // DisplayID -- CreatureModelPath is the real archive path of the .mdx that displayId natively
+    // resolves to (author-supplied, e.g. pulled from a DBC/SQL dump), same "known-good pair, no
+    // in-memory guesswork" convention as EquipExtension's WXLItemEntryDisplay.csv. This is what makes eager
     // preregistration possible for creatures: without it, the only way to learn a displayId's real
     // model path is the native CreatureDisplayInfo -> CreatureModelData lookup chain, which isn't a
     // real callable function (see DB2.hpp's kCaptureDisplayId/kResolveMerge comments) -- walking its
@@ -252,6 +252,53 @@ namespace wxl::scripts::creatureextension
     // eligible for eager preregistration; anything else simply isn't patched (there is no reactive
     // fallback anymore -- see OnModelLoadPre's doc comment for why).
     static std::unordered_map<uint32_t, std::string> g_sidecarCreatureModelPath;
+
+    // Parsed form of WXLCreatureModels.csv's "Geoset" column. count == 0 means "no filter, render
+    // every geoset natively present" -- same meaning as VPathPopulate/VPathPopulateGlobal's own
+    // geoCount == 0. Cap of 16 mirrors EquipExtension's GeosetFilter.ids[16].
+    struct CreatureGeosetSpec
+    {
+        uint16_t ids[16] = {};
+        uint32_t count   = 0;
+    };
+
+    // Parses the "Geoset" column:
+    //   empty            -> count=0, no filter applied, every geoset renders exactly as the model
+    //                       file natively has it
+    //   "0"              -> count=1, ids=[0] -- keep ONLY skinSectionId 0 (the Skin/base geoset;
+    //                       every other section gets zeroed out of the .skin bytes)
+    //   "xxxx,yyyy,..."  -> count=N+1, ids=[0, xxxx, yyyy, ...] -- Skin (0) is always implied
+    //                       alongside whatever ids are explicitly listed, same way a creature's own
+    //                       base body is never something you have to ask for separately; an
+    //                       explicit "0" in the list is just a no-op duplicate of the implied one,
+    //                       not a second entry
+    static CreatureGeosetSpec ParseCreatureGeosetSpec(const char* spec)
+    {
+        CreatureGeosetSpec f = {};
+        if (!spec || !*spec) return f; // empty column -- no filter, render every geoset
+
+        f.ids[f.count++] = 0; // Skin geoset is always implied once any filtering is requested at all
+
+        const char* p = spec;
+        while (*p && f.count < 16)
+        {
+            while (*p == ' ' || *p == '\t' || *p == ',') ++p;
+            if (*p < '0' || *p > '9') break;
+
+            uint32_t v = 0;
+            while (*p >= '0' && *p <= '9') v = v * 10u + static_cast<uint32_t>(*p++ - '0');
+
+            bool dup = false;
+            for (uint32_t i = 0; i < f.count; ++i)
+                if (f.ids[i] == static_cast<uint16_t>(v)) { dup = true; break; }
+            if (!dup) f.ids[f.count++] = static_cast<uint16_t>(v);
+        }
+        return f;
+    }
+
+    // Keyed the same way, and dedup'd the same first-seen-wins way, as g_sidecarCreatureModelPath --
+    // populated from the same WXLCreatureModels.csv row, just a different column.
+    static std::unordered_map<uint32_t, CreatureGeosetSpec> g_sidecarCreatureGeoset;
 
     static void LoadCreatureTextureSidecarFile(const char* path)
     {
@@ -313,6 +360,7 @@ namespace wxl::scripts::creatureextension
         const std::vector<std::string> header = ParseCsvLine(lines[0].c_str());
         const int cDisplay = FindCsvColumn(header, "DisplayID");
         const int cModel   = FindCsvColumn(header, "CreatureModelPath");
+        const int cGeoset  = FindCsvColumn(header, "Geoset"); // optional -- absent is fine, not an error
 
         if (cDisplay < 0 || cModel < 0)
         {
@@ -341,6 +389,8 @@ namespace wxl::scripts::creatureextension
                 continue;
 
             g_sidecarCreatureModelPath.emplace(displayId, modelPath);
+            if (cGeoset >= 0)
+                g_sidecarCreatureGeoset.emplace(displayId, ParseCreatureGeosetSpec(CsvField(row, cGeoset)));
             ++loaded;
         }
 
@@ -451,9 +501,15 @@ namespace wxl::scripts::creatureextension
         {
             char matSpec[2048] = {};
             BuildCreatureMaterialPatchSpec(matSpec, sizeof(matSpec), displayId);
-            if (!matSpec[0])
+
+            const CreatureGeosetSpec* geoSpec = nullptr;
+            auto geoIt = g_sidecarCreatureGeoset.find(displayId);
+            if (geoIt != g_sidecarCreatureGeoset.end() && geoIt->second.count > 0) geoSpec = &geoIt->second;
+
+            if (!matSpec[0] && !geoSpec)
             {
-                // Model path known but no texture rows for this displayId -- nothing to bake.
+                // Model path known, but no texture rows AND no (non-empty) Geoset column entry --
+                // nothing to bake.
                 continue;
             }
 
@@ -462,9 +518,12 @@ namespace wxl::scripts::creatureextension
             // No texPath (only materialPatchSpec) -- creature texture rows are all TextureType-keyed.
             char vModelPath[280] = {};
             bool registered = VPathPopulateGlobal(realModelPath.c_str(), displayId, nullptr, matSpec,
+                                                   geoSpec ? geoSpec->ids : nullptr,
+                                                   geoSpec ? geoSpec->count : 0,
                                                    vModelPath, sizeof(vModelPath));
-            CreatureLog("  preregister: display=%u real='%s' vpath='%s' spec='%s' registered=%d",
-                        displayId, realModelPath.c_str(), vModelPath, matSpec, registered ? 1 : 0);
+            CreatureLog("  preregister: display=%u real='%s' vpath='%s' spec='%s' geoCount=%u registered=%d",
+                        displayId, realModelPath.c_str(), vModelPath, matSpec,
+                        geoSpec ? geoSpec->count : 0u, registered ? 1 : 0);
             if (!registered || !vModelPath[0]) continue;
 
             ++registeredCount;

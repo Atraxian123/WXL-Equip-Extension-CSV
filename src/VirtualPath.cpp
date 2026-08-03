@@ -745,12 +745,14 @@ namespace wxl::scripts::equipextension
 
     bool VPathPopulateGlobal(const char* realMdxPath, uint32_t itemDisplayId,
                              const char* texPath, const char* materialPatchSpec,
+                             const uint16_t* geoIds, uint32_t geoCount,
                              char* outVirtualPath, size_t outVirtualPathSz)
     {
         if (!realMdxPath || !*realMdxPath) return false;
         const bool hasTexPath = texPath && *texPath;
         const bool hasMatSpec = materialPatchSpec && *materialPatchSpec;
-        if (!hasTexPath && !hasMatSpec) return false;
+        const bool hasGeoFilter = geoIds && geoCount > 0;
+        if (!hasTexPath && !hasMatSpec && !hasGeoFilter) return false;
 
         // Normalise to the same lowercase/.m2 form the host uses for real file I/O -- this is
         // still what gets read off disk below -- then mangle in itemDisplayId to get the actual
@@ -789,6 +791,12 @@ namespace wxl::scripts::equipextension
         std::vector<uint8_t> skinBytes;
         ReadGameFile(rSkin, skinBytes); // skin may be absent for some models; that is OK
 
+        // Same ApplySkinByteFilter used by VPathPopulate -- zeroes the raw index bytes of every
+        // submesh whose sectionId isn't in geoIds, in place, before the bytes go in the table. A
+        // no-op (returns immediately) when geoCount == 0 or skinBytes is empty/malformed.
+        if (hasGeoFilter)
+            ApplySkinByteFilter(skinBytes, geoIds, geoCount);
+
         // Material-CSV texture-value patching runs BEFORE the base ModelTexture_N bake -- see the
         // matching comment in VPathPopulate above. A sidecar row claims and HARDCODEs its own
         // texture-unit records first, whatever TextureType it declares; PatchReplaceableTextureTypes
@@ -805,9 +813,10 @@ namespace wxl::scripts::equipextension
             PatchReplaceableTextureTypes(mdxBytes, texPath);
         }
 
-        VPathLog("  VPathPopulateGlobal: '%s' (displayId=%u) -> vkey='%s' mdx=%zu skin=%zu bytes (tex='%s' spec='%s')",
+        VPathLog("  VPathPopulateGlobal: '%s' (displayId=%u) -> vkey='%s' mdx=%zu skin=%zu bytes "
+                 "(tex='%s' spec='%s' geoCount=%u)",
                  normPath, itemDisplayId, vKey, mdxBytes.size(), skinBytes.size(),
-                 hasTexPath ? texPath : "", hasMatSpec ? materialPatchSpec : "");
+                 hasTexPath ? texPath : "", hasMatSpec ? materialPatchSpec : "", geoCount);
 
         char vSkin[280];
         VirtualSkinPath(vSkin, sizeof(vSkin), vKey);
