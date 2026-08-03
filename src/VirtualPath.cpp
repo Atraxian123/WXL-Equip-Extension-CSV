@@ -82,11 +82,6 @@ namespace wxl::scripts::equipextension
         // of that file for the life of the process. See VPathPopulateGlobal.
         std::unordered_map<std::string, std::vector<uint8_t>> g_globalOverrides;
 
-        // Lazy-bake resolvers, tried in registration order on a g_globalOverrides miss. See
-        // VPathRegisterLazyResolver's doc comment in VirtualPath.hpp. Typically holds one entry per
-        // consumer module (weapons, creatures); registration happens once at static-init time.
-        std::vector<VPathLazyResolver> g_lazyResolvers;
-
         // ─── Key building ─────────────────────────────────────────────────────
 
         // Sorts ids[0..n-1] ascending in place (insertion sort; n <= 16).
@@ -602,32 +597,13 @@ namespace wxl::scripts::equipextension
             if (!name) return false;
 
             // Global overrides apply to every loader, not just our own mangled paths, so this
-            // has to run before the "_wxl_" short-circuit below. Guarded on g_lazyResolvers too now:
-            // with eager preregister compiled out, g_globalOverrides can legitimately still be empty
-            // here even though there's real work for this module to do on a miss.
-            if (!g_globalOverrides.empty() || !g_lazyResolvers.empty())
+            // has to run before the "_wxl_" short-circuit below. g_globalOverrides is normally
+            // empty (no cost beyond one branch) unless the sidecar registered a real-path patch.
+            if (!g_globalOverrides.empty())
             {
                 char norm[264];
                 NormalizeRealPath(norm, sizeof(norm), name);
                 auto git = g_globalOverrides.find(norm);
-
-                // Not baked yet -- this is the genuine "asked for it right now, bake it right now"
-                // moment: earlier than this, nothing has requested the bytes yet (wasted work if
-                // baked eagerly and never actually needed); any later than this, the loader has
-                // already been handed a miss. Give each registered resolver a chance to decode norm
-                // into an id it recognizes and bake it on the spot, stopping at the first one that
-                // does. Skipped entirely once the table already has this exact key -- e.g. eager
-                // preregister already covered it, or a previous miss already lazily baked it.
-                if (git == g_globalOverrides.end())
-                {
-                    for (VPathLazyResolver resolver : g_lazyResolvers)
-                    {
-                        if (!resolver || !resolver(norm)) continue;
-                        git = g_globalOverrides.find(norm);
-                        if (git != g_globalOverrides.end()) break;
-                    }
-                }
-
                 if (git != g_globalOverrides.end())
                 {
                     VPathLog("  VirtualProvide(global): '%s' -> %zu bytes", name, git->second.size());
@@ -839,42 +815,6 @@ namespace wxl::scripts::equipextension
         g_globalOverrides.emplace(vKey, std::move(mdxBytes));
         if (!skinBytes.empty())
             g_globalOverrides.emplace(vSkin, std::move(skinBytes));
-        return true;
-    }
-
-    void VPathRegisterLazyResolver(VPathLazyResolver resolver)
-    {
-        if (resolver) g_lazyResolvers.push_back(resolver);
-    }
-
-    bool VPathDecodeGlobalVirtualKey(const char* virtualPathName, char* outNormPath, size_t outNormPathSz,
-                                     uint32_t* outDisplayId)
-    {
-        if (!virtualPathName || !outNormPath || outNormPathSz == 0 || !outDisplayId) return false;
-
-        const char* lastDot = nullptr;
-        for (const char* p = virtualPathName; *p; ++p) if (*p == '.') lastDot = p;
-        if (!lastDot) return false; // no extension -- not a shape BuildGlobalVirtualKey produces
-
-        // Walk backward from the extension over ASCII digits.
-        const char* digitsEnd = lastDot;
-        const char* digitsBegin = digitsEnd;
-        while (digitsBegin > virtualPathName && digitsBegin[-1] >= '0' && digitsBegin[-1] <= '9')
-            --digitsBegin;
-        if (digitsBegin == digitsEnd) return false;                       // no digit run at all
-        if (digitsBegin == virtualPathName || digitsBegin[-1] != '_') return false; // no '_' before it
-
-        uint32_t displayId = 0;
-        for (const char* d = digitsBegin; d < digitsEnd; ++d)
-            displayId = displayId * 10u + static_cast<uint32_t>(*d - '0');
-
-        const size_t stemLen = static_cast<size_t>((digitsBegin - 1) - virtualPathName); // exclude '_'
-        const size_t extLen  = std::strlen(lastDot);
-        if (stemLen + extLen >= outNormPathSz) return false;
-
-        std::memcpy(outNormPath, virtualPathName, stemLen);
-        std::memcpy(outNormPath + stemLen, lastDot, extLen + 1); // includes null terminator
-        *outDisplayId = displayId;
         return true;
     }
 }
