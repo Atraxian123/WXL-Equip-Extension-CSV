@@ -20,6 +20,7 @@
 #include "game/io/Io.hpp"
 #include "offsets/engine/Io.hpp"
 #include "offsets/game/DB2.hpp"
+#include "offsets/game/M2.hpp"
 
 #include <windows.h>
 
@@ -42,6 +43,7 @@ namespace wxl::scripts::creatureextension
 {
     namespace ev  = wxl::events;
     namespace db2 = wxl::offsets::game::db2;
+    namespace m2  = wxl::offsets::game::m2;
 
     // ─── Logging ────────────────────────────────────────────────────────────────
     // Same opt-in-file-log shape as EquipExtension's EquipLog/EquipLogEnabled, kept separate (own
@@ -501,6 +503,7 @@ namespace wxl::scripts::creatureextension
         // client's own archive/file-I/O subsystems are guaranteed up.
         on<&CreatureExtension::OnCreatureModelResolve>(ev::Event::OnCreatureModelResolve);
         on<&CreatureExtension::OnItemSlotChange>(ev::Event::OnItemSlotChange);
+        on<&CreatureExtension::OnModelLoad>(ev::Event::OnModelLoad); // TEMPORARY DIAGNOSTIC, see .hpp
     }
 
     // Not item/equip-related -- reused purely as an early, reliable trigger. OnItemSlotChange is
@@ -543,6 +546,8 @@ namespace wxl::scripts::creatureextension
         {
             *reinterpret_cast<const char**>(static_cast<uint8_t*>(a.record) + db2::creaturemodeldata::kOffModelName)
                 = stashedIt->second.c_str();
+            CreatureLog("model resolve (cached): display=%u modelId=%u record=%p -> vpath='%s'",
+                        a.displayId, a.modelId, a.record, stashedIt->second.c_str());
             return;
         }
 
@@ -558,6 +563,8 @@ namespace wxl::scripts::creatureextension
         {
             *reinterpret_cast<const char**>(static_cast<uint8_t*>(a.record) + db2::creaturemodeldata::kOffModelName)
                 = stashedIt->second.c_str();
+            CreatureLog("model resolve (cached, post-preload): display=%u modelId=%u record=%p -> vpath='%s'",
+                        a.displayId, a.modelId, a.record, stashedIt->second.c_str());
             return;
         }
 
@@ -588,6 +595,29 @@ namespace wxl::scripts::creatureextension
         stashed = vModelPath;
         *reinterpret_cast<const char**>(static_cast<uint8_t*>(a.record) + db2::creaturemodeldata::kOffModelName)
             = stashed.c_str();
+    }
+
+    // TEMPORARY DIAGNOSTIC (see the doc comment on the declaration in CreatureExtension.hpp).
+    //
+    // Filtered to manawyrm2mount so it doesn't flood the log with every unrelated model in the
+    // scene. pathStem/header/fileSize are read directly off the runtime M2Model object
+    // (offsets/game/M2.hpp), independent of anything OnCreatureModelResolve did or didn't write --
+    // this reflects what the engine actually LOADED, not what CreatureModelData's row currently
+    // says. Comparing this against the "model resolve (cached): ..." lines tells us whether a given
+    // visual change (e.g. a mount summon, or a repeat morph) corresponds to a fresh model load here,
+    // or whether the object just started rendering an already-loaded resource with no load event of
+    // its own -- the two have very different fixes.
+    void CreatureExtension::OnModelLoad(const ev::ModelLoadArgs& a)
+    {
+        if (!a.model) return;
+        const char* pathStem = reinterpret_cast<const char*>(
+            static_cast<uint8_t*>(a.model) + m2::kOffModelPathStem);
+        if (!pathStem[0] || !std::strstr(pathStem, "manawyrm2mount")) return;
+
+        void*    header = *reinterpret_cast<void**>(static_cast<uint8_t*>(a.model) + m2::kOffModelHeader);
+        uint32_t fileSz  = *reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(a.model) + m2::kOffModelFileSize);
+        CreatureLog("DIAG OnModelLoad: model=%p pathStem='%s' header=%p fileSize=%u",
+                    a.model, pathStem, header, fileSz);
     }
 
     // Self-registration: file-scope instance binds handlers at DLL load via EventScript ctor.

@@ -35,5 +35,12 @@ namespace wxl::scripts::creatureextension
         // before any creature could possibly need to resolve. No item/equip-related work happens
         // here; the args are ignored.
         void OnItemSlotChange(const wxl::events::ItemSlotChangeArgs& a);
+
+        // TEMPORARY DIAGNOSTIC: logs pathStem/model/header/fileSize for every manawyrm2mount M2
+        // load, so we can see actual model LOADS (not just CreatureModelData resolves, which
+        // OnCreatureModelResolve already logs) -- specifically whether a mount summon or a repeat
+        // morph produces its own fresh load, or silently reuses an already-loaded resource without
+        // ever reaching this event. Remove once the mount/shared-model investigation concludes.
+        void OnModelLoad(const wxl::events::ModelLoadArgs& a);
     };
 }
