@@ -19,6 +19,7 @@ Needless to say, this is NOT compatible with withe either the base module or the
 ## Requirements
 - **WarcraftXL** installed in the WoW 3.3.5a client directory (`d3d9.dll` proxy + `WarcraftXL.dll`).
 - This module is compiled into `WarcraftXL.dll` automatically — no separate DLL, no additional files needed at runtime.
+- If possible, also use the Host extension.
 
 **NOTE: this specific module uses an event implemented in this branch of the WXL-Core, at the moment pending Pulling from the main branch.**
 https://github.com/Atraxian123/wxl-core
@@ -113,6 +114,10 @@ Sidecars are searched in:
 - `DBFilesClient\WXLItemDisplayModelMaterials.csv`
 - `WXLItemEntryDisplay.csv`
 - `DBFilesClient\WXLItemEntryDisplay.csv`
+- `WXLCreatureModels.csv`
+- `DBFilesClient\WXLCreatureModels.csv`
+- `WXLCreatureTextures.csv`
+- `DBFilesClient\WXLCreatureTextures.csv`
 
 - the same `DBFilesClient\...` paths inside every `Data\*.MPQ` patch, including open-folder `.MPQ` patches
 
@@ -165,6 +170,40 @@ Sidecar used to declare weapon item IDs and their Display IDs, it was necessary 
 | `ItemID` | Item Id matching the entry in the .dbc |
 | `DisplayID` | Item Display Id matching the entry in the .dbc |
 | `Folder` | Folder where the model is, either Weapon, Shield or Collections in rare cases when someone put fist weapons there in the listfile |
+
+### `WXLCreatureModels.csv`
+
+Sidecar used to specify which CreatureDisplayID and Creature Models have to be pre-loaded and whith which visible geosets
+
+| Column | Meaning |
+|--------|---------|
+| `DisplayID` | creature display ID entry as in the CreatureDisplayInfo.dbc |
+| `CreatureModelPath` | full path of the model to use for pre-loading ending with the .mdx extension eg. creature\manawyrm2mount\manawyrm2mount.mdx |
+| `Geoset` | geosets of the model that will be rendered: empty for all geosets, 0 for only the base skin geosets, "xxxx, yyyy, ..." to render multiple geosets |
+
+The creation of the virtual models is doen eagerly at the start of the client. Note that having many models pre-loaded this way will be very memory intensive. Beware of the 4GB ram cap for the 32bit client.
+
+### `WXLCreatureTextures.csv`
+
+Sidecar used to specify which textures will be baked into the virtual pre-loaded creature model.
+
+| Column | Meaning |
+|--------|---------|
+| `DisplayID` | creature display ID entry as in the CreatureDisplayInfo.dbc |
+| `TextureType` | Texture Type of the texture that will be baked into the pre-loaded model, see the table later in the readme |
+| `TexturePath` |  full path of the texture to bake in the pre-loaded model. eg. creature\manawyrm2mount\manawyrm2mount_armor_1.blp |
+
+Note that if the monster model in the CreatureDisplayInfo.dbc entry already has textures declared (for example Monster_1 _2 or _3) adding them into this sidecar will get precedente over the .dbc entry. 
+
+### `Changes to the CreatureModelData.dbc and CreatureDisplayInfo.dbc`
+
+To allow for easy loading of the pre-loaded models by the client, a suffix must be added to the name of the model in the CreatureModelData.dbc.
+The suffix is _xxxx there xxxx is the CreatureDisplayID that is specified in the WXLCreatureModel.csv sidecar.
+
+For example: creature\manawyrm2mount\manawyrm2mount.mdx with display ID 33113 will become creature\manawyrm2mount\manawyrm2mount_33113.mdx
+Otherwise the new virtual model will be pre-loaded, but never used by the client.
+
+The corresponding CreatureDisplayInfo.dbc etry will have to specify the correct model id from the CreatureModelData.dbc.
 
 ---
 

@@ -32,5 +32,15 @@ namespace wxl::scripts::equipextension
         void OnBuildBonePalette(const wxl::events::BuildBonePaletteArgs& a);
 		void OnWeaponVisualChange(const wxl::events::WeaponVisualChangeArgs& a);	//ATRAXIAN
         void OnItemDisplayLookup(const wxl::events::ItemDisplayLookupArgs& a);
+
+        // Not model-load-related at all -- reused purely as the earliest possible, unconditional
+        // trigger to kick the one-time weapon sidecar load + eager preregister off. OnModelLoadPre
+        // fires for ANY model init anywhere in the client, including the login/char-select glue
+        // scene's own preview models, well before OnItemSlotChange/OnWeaponVisualChange ever fire
+        // for the char-select preview character (see CreatureExtension.hpp's identical reasoning --
+        // same fix, same rationale, applied here for consistency). LoadSidecarModels is idempotent
+        // (no-op after the first call), so this is purely additive: the existing OnItemSlotChange/
+        // OnWeaponVisualChange/LookupItemDisplayId call sites stay in place as redundant safety nets.
+        void OnModelLoadPre(const wxl::events::ModelLoadArgs& a);
     };
 }

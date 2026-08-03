@@ -96,8 +96,13 @@ namespace wxl::scripts::equipextension
      * loader instead (e.g. by pointing the resolved ItemDisplayInfo model field at it).
      * outVirtualPath, if non-null, receives that path so the caller can do so.
      *
-     * No geoset filter, no per-batch texture-slot override -- callers that need those should still
-     * go through VPathPopulate on a per-attach basis.
+     * No per-batch texture-slot override -- callers that need that should still go through
+     * VPathPopulate on a per-attach basis. A geoset filter IS supported here (geoIds/geoCount),
+     * unlike the original version of this function -- it behaves the same as VPathPopulate's own
+     * geoIds/geoCount: submesh sections whose sectionId isn't in the list get their indices zeroed
+     * out of the .skin bytes, geoCount == 0 means "no filter, keep every section". Like texPath and
+     * materialPatchSpec, it's part of the (path, itemDisplayId) pair's first-registration-wins bake --
+     * not re-appliable later with different ids for an already-registered pair.
      *
      * @param realMdxPath        real archive path of the .mdx (as ItemDisplayInfo/sidecar would give it)
      * @param itemDisplayId      ItemDisplayInfo display id this patch belongs to; mangled into the
@@ -111,6 +116,10 @@ namespace wxl::scripts::equipextension
      *                           materialPatchSpec
      * @param materialPatchSpec  batch-scoped material texture patch spec (see BuildMaterialPatchSpec) --
      *                           pass nullptr/empty to skip this and only bake texPath
+     * @param geoIds             skinSectionIds to keep; every other section's indices are zeroed out of
+     *                           the .skin bytes -- pass nullptr/0 (with geoCount) to skip this and keep
+     *                           every section as-is
+     * @param geoCount           number of entries in geoIds
      * @param outVirtualPath     optional destination buffer that receives the virtual path the
      *                           patched bytes were registered under (e.g. "...\\model_12345.m2")
      * @param outVirtualPathSz   size in bytes of outVirtualPath
@@ -118,5 +127,6 @@ namespace wxl::scripts::equipextension
      */
     bool VPathPopulateGlobal(const char* realMdxPath, uint32_t itemDisplayId,
                              const char* texPath, const char* materialPatchSpec,
+                             const uint16_t* geoIds = nullptr, uint32_t geoCount = 0,
                              char* outVirtualPath = nullptr, size_t outVirtualPathSz = 0);
 }

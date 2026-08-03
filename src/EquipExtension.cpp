@@ -2189,6 +2189,7 @@ static void BuildMaterialPatchSpecWeaponFallback(char* out, size_t outSz,
                 char vModelPath[280] = {};
                 bool registered = VPathPopulateGlobal(modelPath, displayId, texPath[0] ? texPath : nullptr,
                                                        matTexSpec[0] ? matTexSpec : nullptr,
+                                                       nullptr, 0, // no geoset filter for weapons
                                                        vModelPath, sizeof(vModelPath));
                 EquipLog("  weapon patch: model=%u path='%s' vpath='%s' tex='%s' spec='%s' registered=%d",
                          modelColumn, modelPath, vModelPath, texPath, matTexSpec, registered ? 1 : 0);
@@ -2347,6 +2348,13 @@ static void BuildMaterialPatchSpecWeaponFallback(char* out, size_t outSz,
             *reinterpret_cast<const char**>(rec + db2::itemdisplayinfo::kOffModel1) = it->second.vModel[0].c_str();
         if (!it->second.vModel[1].empty())
             *reinterpret_cast<const char**>(rec + db2::itemdisplayinfo::kOffModel2) = it->second.vModel[1].c_str();
+    }
+
+    // See the doc comment on the declaration in EquipExtension.hpp for why this exists alongside
+    // the older OnItemSlotChange/OnWeaponVisualChange/LookupItemDisplayId trigger points.
+    void EquipExtension::OnModelLoadPre(const ev::ModelLoadArgs&)
+    {
+        LoadSidecarModels(); // no-op after the first call; runs PreregisterSidecarWeapons at its end
     }
 
     void EquipExtension::OnItemSlotChange(const ev::ItemSlotChangeArgs& a)
@@ -3257,6 +3265,7 @@ static void BuildMaterialPatchSpecWeaponFallback(char* out, size_t outSz,
         on<&EquipExtension::OnBuildBonePalette>(ev::Event::OnBuildBonePalette);
         on<&EquipExtension::OnWeaponVisualChange>(ev::Event::OnWeaponVisualChange);
         on<&EquipExtension::OnItemDisplayLookup>(ev::Event::OnItemDisplayLookup);
+        on<&EquipExtension::OnModelLoadPre>(ev::Event::OnModelLoadPre);
     }
 
     // Self-registration: file-scope instance binds handlers at DLL load via EventScript ctor.
