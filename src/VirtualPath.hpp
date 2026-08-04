@@ -129,4 +129,72 @@ namespace wxl::scripts::equipextension
                              const char* texPath, const char* materialPatchSpec,
                              const uint16_t* geoIds = nullptr, uint32_t geoCount = 0,
                              char* outVirtualPath = nullptr, size_t outVirtualPathSz = 0);
+
+    /**
+     * @brief Signature for a lazy-bake resolver registered via VPathRegisterLazyResolver.
+     *
+     * Invoked from VirtualProvide on a g_globalOverrides miss, with the already-normalized (lowercase,
+     * .m2-extension) virtual path name the loader just requested. A resolver should try to decode that
+     * name (see VPathDecodeGlobalVirtualKey) into a (real path, id) pair it recognizes, and if so, bake
+     * it right now via VPathPopulateGlobal and return true so VirtualProvide retries the lookup. Return
+     * false if this name doesn't decode to anything the resolver knows about -- the next resolver (if
+     * any) gets a turn.
+     */
+    using VPathLazyResolver = bool (*)(const char* normalizedVirtualPathName);
+
+    /**
+     * @brief Registers a lazy-bake resolver, tried in registration order on every global-override miss.
+     *
+     * This is what makes genuine on-demand baking possible: unlike an eager preregister sweep (which
+     * walks every sidecar-known id at startup), a resolver only ever does work for an id something
+     * actually just asked for. Intended to be called once, from each consumer's own static-init
+     * (mirrors RegisterClientProvider's shape in StorageHook.hpp) -- registering costs one vector
+     * push_back, no I/O, so it's safe there regardless of engine subsystem init order.
+     */
+    void VPathRegisterLazyResolver(VPathLazyResolver resolver);
+
+    /**
+     * @brief Inverts BuildGlobalVirtualKey: decodes a virtual path of the form "<stem>_<id><ext>" back
+     *        into its normalized real path ("<stem><ext>") and the id mangled into it.
+     *
+     * Finds the extension (text from the last '.'), then the run of ASCII digits immediately before
+     * it; if that digit run is itself immediately preceded by '_', the digits decode as outDisplayId
+     * and everything before that '_' plus the extension decodes as outNormPath. Returns false if the
+     * name doesn't have that shape (no '.', no digit run, or no '_' before it).
+     *
+     * This is a syntactic decode only -- it does NOT confirm outDisplayId is one the caller actually
+     * knows about, or that outNormPath is really the path that id's real model lives at. A real archive
+     * path that innocently happens to end in "_<digits>.m2" decodes "successfully" too. Callers (e.g. a
+     * VPathLazyResolver) must still check the decoded id against their own known-id table before
+     * treating the decode as authoritative.
+     * @param outNormPath    destination buffer for the decoded normalized real path
+     * @param outNormPathSz  size of outNormPath in bytes
+     * @param outDisplayId   destination for the decoded id
+     * @return true if virtualPathName had the "<stem>_<digits><ext>" shape and both outputs were written
+     */
+    bool VPathDecodeGlobalVirtualKey(const char* virtualPathName, char* outNormPath, size_t outNormPathSz,
+                                     uint32_t* outDisplayId);
+
+    /**
+     * @brief Reads a boolean value out of WXLExtendedEquipment.ini, sitting beside WarcraftXL.dll
+     *        itself -- this module is built into WarcraftXL.dll (there is no separate
+     *        WXLExtendedEquipment.dll), so in practice that means the game's own root folder.
+     *
+     * The ini's location is derived from WarcraftXL.dll's own path (via GetModuleHandleEx's
+     * from-address lookup on this function's own code, then GetModuleFileName) -- NOT from the
+     * process's current working directory, which for a game client is usually the same as the game
+     * root anyway, but isn't guaranteed to be (and costs nothing extra to not rely on). "Root folder
+     * of the .dll" means exactly that: the same directory WarcraftXL.dll itself lives in, sidecar
+     * CSVs and all.
+     *
+     * Uses the standard Win32 GetPrivateProfileInt convention: any value that parses as a nonzero
+     * integer is true, "0" or an unparseable value is false. If the ini file, the section, or the key
+     * is missing entirely, defaultValue is returned untouched -- there is no error/warning path,
+     * missing config is just "use the default", same as every other sidecar file in this module being
+     * entirely optional.
+     * @param section       ini section name, e.g. "EagerPreload"
+     * @param key           key within that section, e.g. "Creatures"
+     * @param defaultValue  value to return if the ini/section/key can't be found or read
+     */
+    bool WxlIniGetBool(const char* section, const char* key, bool defaultValue);
 }

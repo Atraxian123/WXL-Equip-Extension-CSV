@@ -1312,7 +1312,14 @@ namespace wxl::scripts::equipextension
         EquipLog("sidecar table ready: displays=%zu materialDisplays=%zu itemEntryDisplays=%zu",
                  g_sidecarModels.size(), g_sidecarMaterials.size(), g_sidecarItemDisplay.size());
 
-        PreregisterSidecarWeapons();
+        // Default true (matches the old always-on behavior) if WXLExtendedEquipment.ini, its
+        // [EagerPreload] section, or its Weapons key is missing -- see WxlIniGetBool's doc comment.
+        // Turning this off is safe on its own, with no lazy-resolver counterpart needed: the existing
+        // OnItemSlotChange/OnWeaponVisualChange/OnItemDisplayLookup call sites already patch a weapon
+        // reactively the moment it's actually equipped, eager preload only exists to additionally
+        // cover it ahead of that (e.g. for the char-select preview character).
+        if (WxlIniGetBool("EagerPreload", "Weapons", true))
+            PreregisterSidecarWeapons();
     }
 
     // ─── Path builders ────────────────────────────────────────────────────────────

@@ -36,6 +36,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include <windows.h>
+
 namespace wxl::scripts::equipextension
 {
     namespace
@@ -81,6 +83,11 @@ namespace wxl::scripts::equipextension
         // paths this module itself constructed. Never evicted; the patch is a permanent property
         // of that file for the life of the process. See VPathPopulateGlobal.
         std::unordered_map<std::string, std::vector<uint8_t>> g_globalOverrides;
+
+        // Lazy-bake resolvers, tried in registration order on a g_globalOverrides miss. See
+        // VPathRegisterLazyResolver's doc comment in VirtualPath.hpp. Registration happens once per
+        // consumer at static-init time.
+        std::vector<VPathLazyResolver> g_lazyResolvers;
 
         // ─── Key building ─────────────────────────────────────────────────────
 
@@ -597,13 +604,32 @@ namespace wxl::scripts::equipextension
             if (!name) return false;
 
             // Global overrides apply to every loader, not just our own mangled paths, so this
-            // has to run before the "_wxl_" short-circuit below. g_globalOverrides is normally
-            // empty (no cost beyond one branch) unless the sidecar registered a real-path patch.
-            if (!g_globalOverrides.empty())
+            // has to run before the "_wxl_" short-circuit below. Guarded on g_lazyResolvers too:
+            // with eager preregister off (see WxlIniGetBool), g_globalOverrides can legitimately
+            // still be empty here even though there's real work for a resolver to do on a miss.
+            if (!g_globalOverrides.empty() || !g_lazyResolvers.empty())
             {
                 char norm[264];
                 NormalizeRealPath(norm, sizeof(norm), name);
                 auto git = g_globalOverrides.find(norm);
+
+                // Not baked yet -- this is the genuine "asked for it right now, bake it right now"
+                // moment: earlier than this, nothing has requested the bytes yet (wasted work if
+                // baked eagerly and never actually needed); any later than this, the loader has
+                // already been handed a miss. Give each registered resolver a chance to decode norm
+                // into an id it recognizes and bake it on the spot, stopping at the first one that
+                // does. Skipped entirely once the table already has this exact key -- e.g. eager
+                // preload already covered it, or a previous miss already lazily baked it.
+                if (git == g_globalOverrides.end())
+                {
+                    for (VPathLazyResolver resolver : g_lazyResolvers)
+                    {
+                        if (!resolver || !resolver(norm)) continue;
+                        git = g_globalOverrides.find(norm);
+                        if (git != g_globalOverrides.end()) break;
+                    }
+                }
+
                 if (git != g_globalOverrides.end())
                 {
                     VPathLog("  VirtualProvide(global): '%s' -> %zu bytes", name, git->second.size());
@@ -825,5 +851,86 @@ namespace wxl::scripts::equipextension
         if (!skinBytes.empty())
             g_globalOverrides.emplace(vSkin, std::move(skinBytes));
         return true;
+    }
+
+    void VPathRegisterLazyResolver(VPathLazyResolver resolver)
+    {
+        if (resolver) g_lazyResolvers.push_back(resolver);
+    }
+
+    bool VPathDecodeGlobalVirtualKey(const char* virtualPathName, char* outNormPath, size_t outNormPathSz,
+                                     uint32_t* outDisplayId)
+    {
+        if (!virtualPathName || !outNormPath || outNormPathSz == 0 || !outDisplayId) return false;
+
+        const char* lastDot = nullptr;
+        for (const char* p = virtualPathName; *p; ++p) if (*p == '.') lastDot = p;
+        if (!lastDot) return false; // no extension -- not a shape BuildGlobalVirtualKey produces
+
+        // Walk backward from the extension over ASCII digits.
+        const char* digitsEnd = lastDot;
+        const char* digitsBegin = digitsEnd;
+        while (digitsBegin > virtualPathName && digitsBegin[-1] >= '0' && digitsBegin[-1] <= '9')
+            --digitsBegin;
+        if (digitsBegin == digitsEnd) return false;                       // no digit run at all
+        if (digitsBegin == virtualPathName || digitsBegin[-1] != '_') return false; // no '_' before it
+
+        uint32_t displayId = 0;
+        for (const char* d = digitsBegin; d < digitsEnd; ++d)
+            displayId = displayId * 10u + static_cast<uint32_t>(*d - '0');
+
+        const size_t stemLen = static_cast<size_t>((digitsBegin - 1) - virtualPathName); // exclude '_'
+        const size_t extLen  = std::strlen(lastDot);
+        if (stemLen + extLen >= outNormPathSz) return false;
+
+        std::memcpy(outNormPath, virtualPathName, stemLen);
+        std::memcpy(outNormPath + stemLen, lastDot, extLen + 1); // includes null terminator
+        *outDisplayId = displayId;
+        return true;
+    }
+
+    bool WxlIniGetBool(const char* section, const char* key, bool defaultValue)
+    {
+        if (!section || !key) return defaultValue;
+
+        // Resolves the HMODULE of whichever module this very function's own code lives in -- i.e.
+        // WarcraftXL.dll itself (this module is built into it, there is no separate
+        // WXLExtendedEquipment.dll) -- without needing DllMain's hinstDLL (not tracked anywhere in
+        // this module)
+        // and without assuming the process's current working directory has any relationship to the
+        // DLL's own location. GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT: this is a lookup, not a
+        // LoadLibrary -- don't bump the module's refcount for it.
+        HMODULE hMod = nullptr;
+        if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                 GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                 reinterpret_cast<LPCSTR>(&WxlIniGetBool), &hMod) || !hMod)
+        {
+            return defaultValue;
+        }
+
+        char dllPath[MAX_PATH] = {};
+        const DWORD n = GetModuleFileNameA(hMod, dllPath, sizeof(dllPath));
+        if (n == 0 || n >= sizeof(dllPath)) return defaultValue;
+
+        char iniPath[MAX_PATH] = {};
+        const char* lastSlash = std::strrchr(dllPath, '\\');
+        const char* kIniName = "WXLExtendedEquipment.ini";
+        if (lastSlash)
+        {
+            const size_t dirLen = static_cast<size_t>(lastSlash - dllPath) + 1; // include the '\\'
+            if (dirLen + std::strlen(kIniName) >= sizeof(iniPath)) return defaultValue;
+            std::memcpy(iniPath, dllPath, dirLen);
+            std::strcpy(iniPath + dirLen, kIniName);
+        }
+        else
+        {
+            std::strcpy(iniPath, kIniName); // no directory component -- fall back to relative
+        }
+
+        // GetPrivateProfileInt's own convention: missing file/section/key all fall through to
+        // returning nDefault untouched, so there's no separate "does the ini even exist" check
+        // needed here -- same "optional, use the default" treatment as every sidecar CSV.
+        const int v = GetPrivateProfileIntA(section, key, defaultValue ? 1 : 0, iniPath);
+        return v != 0;
     }
 }
