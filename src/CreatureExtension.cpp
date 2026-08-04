@@ -517,6 +517,7 @@ namespace wxl::scripts::creatureextension
         bool registered = VPathPopulateGlobal(pathIt->second.c_str(), displayId, nullptr, matSpec,
                                                geoSpec ? geoSpec->ids : nullptr,
                                                geoSpec ? geoSpec->count : 0,
+                                               true, // evictable -- CreatureLazyResolve rebakes on miss
                                                vModelPath, sizeof(vModelPath));
         CreatureLog("  bake: display=%u real='%s' vpath='%s' spec='%s' geoCount=%u registered=%d",
                     displayId, pathIt->second.c_str(), vModelPath, matSpec,

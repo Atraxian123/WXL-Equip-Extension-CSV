@@ -2197,6 +2197,7 @@ static void BuildMaterialPatchSpecWeaponFallback(char* out, size_t outSz,
                 bool registered = VPathPopulateGlobal(modelPath, displayId, texPath[0] ? texPath : nullptr,
                                                        matTexSpec[0] ? matTexSpec : nullptr,
                                                        nullptr, 0, // no geoset filter for weapons
+                                                       false, // not evictable -- no lazy rebake path
                                                        vModelPath, sizeof(vModelPath));
                 EquipLog("  weapon patch: model=%u path='%s' vpath='%s' tex='%s' spec='%s' registered=%d",
                          modelColumn, modelPath, vModelPath, texPath, matTexSpec, registered ? 1 : 0);
