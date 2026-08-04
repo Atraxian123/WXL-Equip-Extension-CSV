@@ -120,6 +120,22 @@ namespace wxl::scripts::equipextension
      *                           the .skin bytes -- pass nullptr/0 (with geoCount) to skip this and keep
      *                           every section as-is
      * @param geoCount           number of entries in geoIds
+     * @param evictable          if true, this bake is registered as reclaimable: once the combined
+     *                           size of all evictable entries exceeds WXLExtendedEquipment.ini's
+     *                           [Memory] MaxCreatureCacheMB budget, the least-recently-served
+     *                           evictable entries are erased from the table (freeing their memory)
+     *                           to make room, on a first-come basis as new evictable bakes come in --
+     *                           see EvictOverBudget in VirtualPath.cpp. An evicted entry is NOT gone
+     *                           forever: the next VirtualProvide request for it simply misses and, if
+     *                           a VPathLazyResolver is registered that still recognizes it, gets
+     *                           rebaked on the spot. Passing evictable=true WITHOUT also having a
+     *                           lazy resolver in place for whatever id space this call uses is a
+     *                           trap: the entry can still be evicted, but nothing will ever bring it
+     *                           back, so any caller doing this needs its own VPathRegisterLazyResolver
+     *                           registration covering the same ids (e.g. CreatureExtension's
+     *                           CreatureLazyResolve for its own creature displayIds). Default false --
+     *                           matches every existing caller's prior behavior (permanent for the
+     *                           life of the process) unchanged.
      * @param outVirtualPath     optional destination buffer that receives the virtual path the
      *                           patched bytes were registered under (e.g. "...\\model_12345.m2")
      * @param outVirtualPathSz   size in bytes of outVirtualPath
@@ -128,6 +144,7 @@ namespace wxl::scripts::equipextension
     bool VPathPopulateGlobal(const char* realMdxPath, uint32_t itemDisplayId,
                              const char* texPath, const char* materialPatchSpec,
                              const uint16_t* geoIds = nullptr, uint32_t geoCount = 0,
+                             bool evictable = false,
                              char* outVirtualPath = nullptr, size_t outVirtualPathSz = 0);
 
     /**
@@ -191,10 +208,24 @@ namespace wxl::scripts::equipextension
      * integer is true, "0" or an unparseable value is false. If the ini file, the section, or the key
      * is missing entirely, defaultValue is returned untouched -- there is no error/warning path,
      * missing config is just "use the default", same as every other sidecar file in this module being
-     * entirely optional.
+     * entirely optional. Implemented on top of WxlIniGetInt below.
      * @param section       ini section name, e.g. "EagerPreload"
      * @param key           key within that section, e.g. "Creatures"
      * @param defaultValue  value to return if the ini/section/key can't be found or read
      */
     bool WxlIniGetBool(const char* section, const char* key, bool defaultValue);
+
+    /**
+     * @brief Same file/section/key resolution as WxlIniGetBool, but for an arbitrary non-negative
+     *        integer value (e.g. a byte/MB budget) instead of a 0-or-1 flag.
+     *
+     * GetPrivateProfileInt's own underlying type is unsigned, so this is only meaningful for
+     * non-negative values -- callers wanting a negative sentinel should use 0 or treat "<= 0" as their
+     * own "unset" convention instead (see MaxCreatureCacheMB's own <= 0 == "uncapped" convention as an
+     * example).
+     * @param section       ini section name, e.g. "Memory"
+     * @param key           key within that section, e.g. "MaxCreatureCacheMB"
+     * @param defaultValue  value to return if the ini/section/key can't be found or read
+     */
+    int WxlIniGetInt(const char* section, const char* key, int defaultValue);
 }
