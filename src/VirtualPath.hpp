@@ -86,7 +86,9 @@ namespace wxl::scripts::equipextension
      * weapon's base ModelTexture_1/2 (vanilla only auto-binds that natively for Head/Shoulder;
      * everywhere else, including weapons, something has to bake or bind it) and/or a weapon's
      * extra glow/emissive layers. There is no per-cmo eviction for these entries: once registered,
-     * the override stays for the life of the process, and the first (texPath, materialPatchSpec)
+     * the override stays resident until either the process ends or -- for evictable=true entries
+     * only, see the @p evictable parameter below -- it's reclaimed by the memory-cap LRU sweep.
+     * Regardless of eviction, the first (texPath, materialPatchSpec)
      * pair registered for a given (path, itemDisplayId) wins for the rest of the session -- later
      * calls for the same pair with different arguments are no-ops (see g_globalOverrides).
      *
@@ -123,12 +125,21 @@ namespace wxl::scripts::equipextension
      * @param outVirtualPath     optional destination buffer that receives the virtual path the
      *                           patched bytes were registered under (e.g. "...\\model_12345.m2")
      * @param outVirtualPathSz   size in bytes of outVirtualPath
+     * @param evictable          whether this entry is a candidate for the [Memory] MaxCreatureCacheMB
+     *                           LRU eviction sweep (see EvictIfOverCap in VirtualPath.cpp). Pass true
+     *                           ONLY for creature entries -- this is what CreatureExtension.cpp's
+     *                           BakeCreatureDisplay does. Weapon entries (WeaponExtension.cpp's
+     *                           BakeWeaponDisplay) always pass false: weapon overrides are never
+     *                           evictable, by design -- see WXLExtendedEquipment.ini's [Memory]
+     *                           section comment. Defaults to false so any future third caller doesn't
+     *                           silently opt in to eviction without asking for it explicitly.
      * @return true if the override was registered (or was already registered for this path/id pair)
      */
     bool VPathPopulateGlobal(const char* realMdxPath, uint32_t itemDisplayId,
                              const char* texPath, const char* materialPatchSpec,
                              const uint16_t* geoIds = nullptr, uint32_t geoCount = 0,
-                             char* outVirtualPath = nullptr, size_t outVirtualPathSz = 0);
+                             char* outVirtualPath = nullptr, size_t outVirtualPathSz = 0,
+                             bool evictable = false);
 
     /**
      * @brief Signature for a lazy-bake resolver registered via VPathRegisterLazyResolver.
@@ -197,4 +208,15 @@ namespace wxl::scripts::equipextension
      * @param defaultValue  value to return if the ini/section/key can't be found or read
      */
     bool WxlIniGetBool(const char* section, const char* key, bool defaultValue);
+
+    /**
+     * @brief Integer counterpart to WxlIniGetBool -- same ini (WXLExtendedEquipment.ini beside
+     *        WarcraftXL.dll), same GetPrivateProfileInt-based resolution, same "missing file/
+     *        section/key -> defaultValue untouched" behavior. Used for [Memory] MaxCreatureCacheMB,
+     *        which unlike the [EagerPreload] keys is a magnitude, not a bool.
+     * @param section       ini section name, e.g. "Memory"
+     * @param key           key within that section, e.g. "MaxCreatureCacheMB"
+     * @param defaultValue  value to return if the ini/section/key can't be found or read
+     */
+    int WxlIniGetInt(const char* section, const char* key, int defaultValue);
 }

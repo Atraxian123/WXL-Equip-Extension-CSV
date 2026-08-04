@@ -513,11 +513,16 @@ namespace wxl::scripts::creatureextension
         }
 
         // No texPath (only materialPatchSpec) -- creature texture rows are all TextureType-keyed.
+        // evictable=true: creature bakes are the only ones subject to WXLExtendedEquipment.ini's
+        // [Memory] MaxCreatureCacheMB LRU cap -- see VPathPopulateGlobal's doc comment in
+        // VirtualPath.hpp. An evicted entry just gets re-baked here the next time something asks for
+        // it (via CreatureLazyResolve below), so eviction is invisible to correctness, only to cost.
         char vModelPath[280] = {};
         bool registered = VPathPopulateGlobal(pathIt->second.c_str(), displayId, nullptr, matSpec,
                                                geoSpec ? geoSpec->ids : nullptr,
                                                geoSpec ? geoSpec->count : 0,
-                                               vModelPath, sizeof(vModelPath));
+                                               vModelPath, sizeof(vModelPath),
+                                               /*evictable=*/true);
         CreatureLog("  bake: display=%u real='%s' vpath='%s' spec='%s' geoCount=%u registered=%d",
                     displayId, pathIt->second.c_str(), vModelPath, matSpec,
                     geoSpec ? geoSpec->count : 0u, registered ? 1 : 0);

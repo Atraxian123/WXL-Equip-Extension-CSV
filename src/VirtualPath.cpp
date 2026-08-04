@@ -32,6 +32,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <list>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -88,6 +89,43 @@ namespace wxl::scripts::equipextension
         // VPathRegisterLazyResolver's doc comment in VirtualPath.hpp. Registration happens once per
         // consumer at static-init time.
         std::vector<VPathLazyResolver> g_lazyResolvers;
+
+        // ─── Evictable (creature-only) global-override tracking ──────────────────────
+        //
+        // g_globalOverrides itself has no concept of eviction -- entries just sit there for the life
+        // of the process, per VPathPopulateGlobal's own doc comment. This side-tracking exists only
+        // for entries registered with evictable=true (creatures, via BakeCreatureDisplay), to
+        // implement WXLExtendedEquipment.ini's [Memory] MaxCreatureCacheMB soft cap. Weapon entries
+        // (evictable=false) never appear in any of this -- they simply aren't tracked, so nothing
+        // here ever touches or evicts them, matching the ini's "weapon overrides are never
+        // evictable" note.
+        //
+        // One "unit" here == one VPathPopulateGlobal call's worth of bytes (the .mdx entry, plus its
+        // paired .skin entry if one was baked) -- eviction always drops both halves of a unit
+        // together, since a lone .skin entry with no matching .mdx (or vice versa) would just be a
+        // half-served model the next request has to fail on anyway.
+        struct EvictableUnit
+        {
+            std::string vSkinKey; // empty if this bake produced no skin entry
+            size_t      bytes = 0; // combined mdx + skin size, for the running total below
+        };
+
+        // Keyed by vKey (the .mdx virtual path -- the "primary" half of a unit).
+        std::unordered_map<std::string, EvictableUnit> g_evictableUnits;
+
+        // vSkinKey -> owning unit's vKey, so a request that only ever touches the .skin half (the
+        // client asks for .mdx and .skin as two separate file reads) still finds and LRU-touches the
+        // right unit.
+        std::unordered_map<std::string, std::string> g_evictableSkinToUnit;
+
+        // Front = most-recently-served unit, back = least -- classic intrusive LRU. g_evictableLruIt
+        // gives O(1) splice-to-front on touch instead of a linear search.
+        std::list<std::string> g_evictableLru;
+        std::unordered_map<std::string, std::list<std::string>::iterator> g_evictableLruIt;
+
+        // Sum of EvictableUnit::bytes across every currently-resident evictable unit. Compared
+        // against the ini-configured cap on every registration.
+        size_t g_evictableTotalBytes = 0;
 
         // ─── Key building ─────────────────────────────────────────────────────
 
@@ -599,6 +637,12 @@ namespace wxl::scripts::equipextension
 
         // ─── Client-side provider ─────────────────────────────────────────────
 
+        // Forward decls: full definitions sit after VirtualProvide below (they're simple, self-
+        // contained helpers, kept next to the rest of the eviction state/logic for readability), but
+        // VirtualProvide's global-override hit path needs to call EvictableTouch.
+        static void EvictableTouch(const std::string& anyKey);
+        static void EvictIfOverCap();
+
         static bool VirtualProvide(const char* name, std::vector<uint8_t>& out)
         {
             if (!name) return false;
@@ -633,6 +677,8 @@ namespace wxl::scripts::equipextension
                 if (git != g_globalOverrides.end())
                 {
                     VPathLog("  VirtualProvide(global): '%s' -> %zu bytes", name, git->second.size());
+                    // No-op for non-evictable (weapon) entries -- see EvictableTouch's doc comment.
+                    EvictableTouch(git->first);
                     out = git->second;
                     return true;
                 }
@@ -663,6 +709,85 @@ namespace wxl::scripts::equipextension
             Registrar() { wxl::runtime::storage::RegisterClientProvider(&VirtualProvide); }
         };
         static Registrar g_registrar;
+
+        // ─── Evictable (creature-only) LRU sweep ──────────────────────────────────
+        //
+        // Returns the [Memory] MaxCreatureCacheMB cap in BYTES, or 0 for "uncapped" -- covers both
+        // the "<= 0" and "missing entirely" cases from WXLExtendedEquipment.ini's own doc comment,
+        // since WxlIniGetInt already folds "missing" into returning the given default (0) untouched.
+        // Read once and cached: the ini is not expected to change mid-session, and this is checked on
+        // every single evictable registration, so re-parsing the ini file each time would be wasteful.
+        static size_t MaxEvictableCacheBytes() noexcept
+        {
+            static const size_t cached = []() noexcept -> size_t {
+                const int mb = WxlIniGetInt("Memory", "MaxCreatureCacheMB", 0);
+                if (mb <= 0) return 0;
+                return static_cast<size_t>(mb) * 1024ull * 1024ull;
+            }();
+            return cached;
+        }
+
+        // Moves anyKey's owning evictable unit (if any) to the front of the LRU list, marking it
+        // most-recently-served. anyKey may be either a unit's primary (.mdx) key or its paired .skin
+        // key -- both resolve to the same unit. A no-op for any key that isn't evictable-tracked at
+        // all (e.g. every weapon entry, or a creature entry baked before eviction was wired up --
+        // there is no such case today, but the lookup degrades safely either way).
+        static void EvictableTouch(const std::string& anyKey)
+        {
+            if (g_evictableUnits.empty()) return; // fast path: nothing evictable registered at all
+
+            std::string unitKey;
+            if (g_evictableUnits.count(anyKey))
+            {
+                unitKey = anyKey;
+            }
+            else
+            {
+                auto sit = g_evictableSkinToUnit.find(anyKey);
+                if (sit == g_evictableSkinToUnit.end()) return; // not an evictable entry
+                unitKey = sit->second;
+            }
+
+            auto lit = g_evictableLruIt.find(unitKey);
+            if (lit == g_evictableLruIt.end()) return; // metadata/LRU state out of sync -- ignore
+            g_evictableLru.splice(g_evictableLru.begin(), g_evictableLru, lit->second);
+            // splice doesn't invalidate iterators, so lit->second (now at begin()) is still correct;
+            // no need to update g_evictableLruIt.
+        }
+
+        // Drops least-recently-served evictable units (oldest first) until g_evictableTotalBytes is
+        // back under the ini-configured cap, or only one unit remains resident -- deliberately never
+        // evicts the very last unit even if it alone exceeds the cap, since evicting it would just
+        // mean immediately rebaking it on the next request for no net benefit (see
+        // CreatureLazyResolve, which re-bakes any evicted displayId the moment something asks for it
+        // again). Called after every evictable registration.
+        static void EvictIfOverCap()
+        {
+            const size_t cap = MaxEvictableCacheBytes();
+            if (cap == 0) return; // uncapped -- tracked, never evicted, per the ini's own doc comment
+
+            while (g_evictableTotalBytes > cap && g_evictableLru.size() > 1)
+            {
+                const std::string vKey = g_evictableLru.back();
+                g_evictableLru.pop_back();
+                g_evictableLruIt.erase(vKey);
+
+                auto uit = g_evictableUnits.find(vKey);
+                if (uit == g_evictableUnits.end()) continue; // shouldn't happen; stay defensive
+
+                g_globalOverrides.erase(vKey);
+                if (!uit->second.vSkinKey.empty())
+                {
+                    g_globalOverrides.erase(uit->second.vSkinKey);
+                    g_evictableSkinToUnit.erase(uit->second.vSkinKey);
+                }
+
+                g_evictableTotalBytes -= uit->second.bytes;
+                VPathLog("  creature cache evict: '%s' freed %zu bytes (resident now %zu/%zu bytes)",
+                         vKey.c_str(), uit->second.bytes, g_evictableTotalBytes, cap);
+                g_evictableUnits.erase(uit);
+            }
+        }
     }
 
     // ─── Public API ───────────────────────────────────────────────────────────
@@ -772,7 +897,8 @@ namespace wxl::scripts::equipextension
     bool VPathPopulateGlobal(const char* realMdxPath, uint32_t itemDisplayId,
                              const char* texPath, const char* materialPatchSpec,
                              const uint16_t* geoIds, uint32_t geoCount,
-                             char* outVirtualPath, size_t outVirtualPathSz)
+                             char* outVirtualPath, size_t outVirtualPathSz,
+                             bool evictable)
     {
         if (!realMdxPath || !*realMdxPath) return false;
         const bool hasTexPath = texPath && *texPath;
@@ -847,9 +973,34 @@ namespace wxl::scripts::equipextension
         char vSkin[280];
         VirtualSkinPath(vSkin, sizeof(vSkin), vKey);
 
+        // Captured before the moves below -- a moved-from vector's size() is unspecified, so this
+        // has to happen now or not at all.
+        const bool hadSkin = !skinBytes.empty();
+        const size_t totalBytes = mdxBytes.size() + skinBytes.size();
+
         g_globalOverrides.emplace(vKey, std::move(mdxBytes));
-        if (!skinBytes.empty())
+        if (hadSkin)
             g_globalOverrides.emplace(vSkin, std::move(skinBytes));
+
+        // Only creature bakes (evictable=true) are tracked here at all -- see this function's own
+        // doc comment in VirtualPath.hpp and WXLExtendedEquipment.ini's [Memory] section. Weapon
+        // bakes (evictable=false, the default) never enter g_evictableUnits and are therefore never
+        // eligible for eviction, regardless of MaxCreatureCacheMB.
+        if (evictable)
+        {
+            EvictableUnit unit;
+            unit.bytes = totalBytes;
+            if (hadSkin) unit.vSkinKey = vSkin;
+
+            g_evictableUnits[vKey] = unit;
+            if (hadSkin) g_evictableSkinToUnit[vSkin] = vKey;
+
+            g_evictableLru.push_front(std::string(vKey));
+            g_evictableLruIt[vKey] = g_evictableLru.begin();
+            g_evictableTotalBytes += totalBytes;
+
+            EvictIfOverCap();
+        }
         return true;
     }
 
@@ -889,48 +1040,73 @@ namespace wxl::scripts::equipextension
         return true;
     }
 
+    namespace
+    {
+        // Shared by WxlIniGetBool and WxlIniGetInt -- resolves WXLExtendedEquipment.ini's full path
+        // (beside WarcraftXL.dll itself) into outPath. Factored out so both getters resolve it
+        // identically instead of duplicating the HMODULE/GetModuleFileName dance twice.
+        //
+        // Resolves the HMODULE of whichever module this very function's own code lives in -- i.e.
+        // WarcraftXL.dll itself (this module is built into it, there is no separate
+        // WXLExtendedEquipment.dll) -- without needing DllMain's hinstDLL (not tracked anywhere in
+        // this module) and without assuming the process's current working directory has any
+        // relationship to the DLL's own location. GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT: this
+        // is a lookup, not a LoadLibrary -- don't bump the module's refcount for it.
+        static bool ResolveWxlIniPath(char* outPath, size_t outPathSz)
+        {
+            if (!outPath || outPathSz == 0) return false;
+
+            HMODULE hMod = nullptr;
+            if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                     GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                     reinterpret_cast<LPCSTR>(&ResolveWxlIniPath), &hMod) || !hMod)
+            {
+                return false;
+            }
+
+            char dllPath[MAX_PATH] = {};
+            const DWORD n = GetModuleFileNameA(hMod, dllPath, sizeof(dllPath));
+            if (n == 0 || n >= sizeof(dllPath)) return false;
+
+            const char* lastSlash = std::strrchr(dllPath, '\\');
+            const char* kIniName = "WXLExtendedEquipment.ini";
+            if (lastSlash)
+            {
+                const size_t dirLen = static_cast<size_t>(lastSlash - dllPath) + 1; // include '\\'
+                if (dirLen + std::strlen(kIniName) >= outPathSz) return false;
+                std::memcpy(outPath, dllPath, dirLen);
+                std::strcpy(outPath + dirLen, kIniName);
+            }
+            else
+            {
+                if (std::strlen(kIniName) >= outPathSz) return false;
+                std::strcpy(outPath, kIniName); // no directory component -- fall back to relative
+            }
+            return true;
+        }
+    }
+
     bool WxlIniGetBool(const char* section, const char* key, bool defaultValue)
     {
         if (!section || !key) return defaultValue;
 
-        // Resolves the HMODULE of whichever module this very function's own code lives in -- i.e.
-        // WarcraftXL.dll itself (this module is built into it, there is no separate
-        // WXLExtendedEquipment.dll) -- without needing DllMain's hinstDLL (not tracked anywhere in
-        // this module)
-        // and without assuming the process's current working directory has any relationship to the
-        // DLL's own location. GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT: this is a lookup, not a
-        // LoadLibrary -- don't bump the module's refcount for it.
-        HMODULE hMod = nullptr;
-        if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                                 GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                                 reinterpret_cast<LPCSTR>(&WxlIniGetBool), &hMod) || !hMod)
-        {
-            return defaultValue;
-        }
-
-        char dllPath[MAX_PATH] = {};
-        const DWORD n = GetModuleFileNameA(hMod, dllPath, sizeof(dllPath));
-        if (n == 0 || n >= sizeof(dllPath)) return defaultValue;
-
         char iniPath[MAX_PATH] = {};
-        const char* lastSlash = std::strrchr(dllPath, '\\');
-        const char* kIniName = "WXLExtendedEquipment.ini";
-        if (lastSlash)
-        {
-            const size_t dirLen = static_cast<size_t>(lastSlash - dllPath) + 1; // include the '\\'
-            if (dirLen + std::strlen(kIniName) >= sizeof(iniPath)) return defaultValue;
-            std::memcpy(iniPath, dllPath, dirLen);
-            std::strcpy(iniPath + dirLen, kIniName);
-        }
-        else
-        {
-            std::strcpy(iniPath, kIniName); // no directory component -- fall back to relative
-        }
+        if (!ResolveWxlIniPath(iniPath, sizeof(iniPath))) return defaultValue;
 
         // GetPrivateProfileInt's own convention: missing file/section/key all fall through to
         // returning nDefault untouched, so there's no separate "does the ini even exist" check
         // needed here -- same "optional, use the default" treatment as every sidecar CSV.
         const int v = GetPrivateProfileIntA(section, key, defaultValue ? 1 : 0, iniPath);
         return v != 0;
+    }
+
+    int WxlIniGetInt(const char* section, const char* key, int defaultValue)
+    {
+        if (!section || !key) return defaultValue;
+
+        char iniPath[MAX_PATH] = {};
+        if (!ResolveWxlIniPath(iniPath, sizeof(iniPath))) return defaultValue;
+
+        return GetPrivateProfileIntA(section, key, defaultValue, iniPath);
     }
 }

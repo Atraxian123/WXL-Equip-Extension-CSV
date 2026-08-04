@@ -1,0 +1,6 @@
+DisplayID,ModelColumn,TextureType,TexturePath
+53211,0,0,Item\ObjectComponents\Weapon\Woodcutteraxe\Woodcutteraxe_Skin.blp
+53212,0,0,Item\ObjectComponents\Weapon\Bloodfang\Bloodfang_Skin.blp
+53212,1,0,Item\ObjectComponents\Weapon\Bloodfang\Bloodfang_Glow_Emissive.blp
+53213,0,0,Item\ObjectComponents\Weapon\Riftblade\Riftblade_Skin.blp
+53213,0,3,Item\ObjectComponents\Weapon\Riftblade\Riftblade_Blade.blp

@@ -477,9 +477,14 @@ namespace wxl::scripts::weaponextension
 
             // No texPath (only materialPatchSpec) -- weapon texture rows are all TextureType-keyed,
             // same convention as creature texture rows. No geoset filter -- weapons only.
+            // evictable=false (explicit, even though it's also the default): per
+            // WXLExtendedEquipment.ini's [Memory] section, weapon overrides are never evictable --
+            // only CreatureExtension.cpp's BakeCreatureDisplay opts in to the MaxCreatureCacheMB LRU
+            // cap. See VPathPopulateGlobal's doc comment in VirtualPath.hpp for why.
             char vModelPath[280] = {};
             bool registered = VPathPopulateGlobal(realPath.c_str(), displayId, nullptr, matSpec,
-                                                   nullptr, 0, vModelPath, sizeof(vModelPath));
+                                                   nullptr, 0, vModelPath, sizeof(vModelPath),
+                                                   /*evictable=*/false);
             WeaponLog("  bake: display=%u col=%u real='%s' vpath='%s' spec='%s' registered=%d",
                       displayId, col, realPath.c_str(), vModelPath, matSpec, registered ? 1 : 0);
             anyRegistered |= (registered && vModelPath[0]);
