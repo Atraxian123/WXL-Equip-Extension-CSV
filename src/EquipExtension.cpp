@@ -39,6 +39,7 @@
 #include <array>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace wxl::scripts::equipextension
@@ -156,6 +157,15 @@ namespace wxl::scripts::equipextension
     // from their own item database/SQL dump) instead of depending on that guesswork. Checked first;
     // the raw-memory lookup is only a fallback for entries not listed here.
     static std::unordered_map<uint32_t, uint32_t> g_sidecarItemDisplay;
+
+    // Set of every displayId that appears as a value in g_sidecarItemDisplay above -- i.e. every
+    // weapon/shield displayId this module actually knows a sidecar row for. g_sidecarItemDisplay
+    // itself is keyed by itemEntry, not displayId, so it can't be used directly as an "is this
+    // displayId one we know about" membership test; this side table exists purely for that O(1)
+    // check, the same role g_sidecarCreatureModelPath's own keying serves for
+    // CreatureExtension.cpp's CreatureLazyResolve. Populated alongside g_sidecarItemDisplay in
+    // LoadItemDisplaySidecarFile; consulted by WeaponLazyResolve below.
+    static std::unordered_set<uint32_t> g_sidecarKnownWeaponDisplayIds;
 
     // Optional ItemDisplayInfo displayId -> model folder override, from WXLItemEntryDisplay.csv's
     // optional third column (e.g. "Weapon", "Shield"). Consulted by PatchWeaponModelByDisplayId
@@ -1242,6 +1252,10 @@ namespace wxl::scripts::equipextension
                          "ignoring duplicate row displayId=%u", path, itemEntry, ins.first->second, displayId);
                 continue;
             }
+            // Membership set for WeaponLazyResolve -- see its doc comment. Insert regardless of
+            // whether this itemEntry row was new or a duplicate-with-same-displayId (ins.second
+            // false but not the mismatch case above): either way this displayId is confirmed known.
+            g_sidecarKnownWeaponDisplayIds.insert(displayId);
             ++loaded;
 
             if (cFolder >= 0)
@@ -2271,6 +2285,48 @@ static void BuildMaterialPatchSpecWeaponFallback(char* out, size_t outSz,
             PatchWeaponModelByDisplayId(displayId, itemEntry, nullptr);
     }
 
+    // Lazy on-demand counterpart to PreregisterSidecarWeapons, registered with VirtualPath.cpp via
+    // VPathRegisterLazyResolver and invoked from VirtualProvide on a g_globalOverrides miss -- same
+    // shape and same reasoning as CreatureExtension.cpp's CreatureLazyResolve. Runs unconditionally
+    // regardless of the [EagerPreload] Weapons ini setting: with eager preload on, this is just a
+    // safety net for any displayId that slips past the startup sweep; with it off, weapons already
+    // have their own separate reactive net (OnItemSlotChange/OnWeaponVisualChange/OnItemDisplayLookup
+    // patch a weapon the moment it's actually equipped -- see LoadSidecarModels' call site comment),
+    // so this is a second, redundant safety net for that case rather than the only path, unlike
+    // creatures.
+    //
+    // normVirtualPath is whatever VirtualProvide's own NormalizeRealPath produced from the raw loader
+    // request -- already lowercase with a .m2 extension, the form VPathDecodeGlobalVirtualKey expects.
+    // A successful decode only confirms the name has the right *shape* (see that function's doc
+    // comment); the decoded displayId is only trusted once it's confirmed present in
+    // g_sidecarKnownWeaponDisplayIds -- populated from the same WXLItemEntryDisplay.csv sidecar rows
+    // PreregisterSidecarWeapons itself walks -- and PatchWeaponModelByDisplayId re-derives everything
+    // it bakes from the sidecar tables and a fresh ItemDisplayInfo lookup by that displayId, not from
+    // the decoded path, so a coincidental decode of an unrelated real archive path can't smuggle in
+    // bytes for the wrong model.
+    //
+    // owner28 is passed as nullptr, same as PreregisterSidecarWeapons' own pre-registration calls --
+    // no live character object is available here either, so a forced race/gender weapon variant
+    // (Icon2 flag 0x80) is skipped for now and left to be patched later, reactively, on the wearer's
+    // first real equip via OnWeaponVisualChange instead.
+    static bool WeaponLazyResolve(const char* normVirtualPath)
+    {
+        LoadSidecarModels(); // no-op after the first call; must run before the sidecar tables are read
+
+        char decodedPath[264] = {};
+        uint32_t displayId = 0;
+        if (!VPathDecodeGlobalVirtualKey(normVirtualPath, decodedPath, sizeof(decodedPath), &displayId))
+            return false;
+
+        if (g_sidecarKnownWeaponDisplayIds.find(displayId) == g_sidecarKnownWeaponDisplayIds.end())
+            return false; // not a displayId this module knows about
+
+        EquipLog("  WeaponLazyResolve: miss '%s' decoded displayId=%u -- baking now",
+                 normVirtualPath, displayId);
+        PatchWeaponModelByDisplayId(displayId, 0, nullptr);
+        return true;
+    }
+
     // ─── Event handler implementations ───────────────────────────────────────────
 
     // Tracks weapon-visual field changes in g_weaponAttached and, once the item entry resolves to a
@@ -3273,6 +3329,13 @@ static void BuildMaterialPatchSpecWeaponFallback(char* out, size_t outSz,
         on<&EquipExtension::OnWeaponVisualChange>(ev::Event::OnWeaponVisualChange);
         on<&EquipExtension::OnItemDisplayLookup>(ev::Event::OnItemDisplayLookup);
         on<&EquipExtension::OnModelLoadPre>(ev::Event::OnModelLoadPre);
+
+        // Cheap (one vector push_back, no I/O) so it's safe here regardless of engine subsystem init
+        // order -- see VPathRegisterLazyResolver's doc comment in VirtualPath.hpp, and
+        // CreatureExtension's constructor for the identical pattern. Registered unconditionally,
+        // independent of the [EagerPreload] Weapons ini setting, so lazy baking works whether or not
+        // eager preload is turned on.
+        VPathRegisterLazyResolver(&WeaponLazyResolve);
     }
 
     // Self-registration: file-scope instance binds handlers at DLL load via EventScript ctor.
