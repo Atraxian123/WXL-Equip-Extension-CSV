@@ -249,15 +249,23 @@ namespace wxl::scripts::weaponextension
 
     // ─── Sidecar table ──────────────────────────────────────────────────────────
     //
-    // WXLWeaponModels.csv columns: DisplayID, Model1Path, Model2Path. One row per DisplayID --
-    // Model1Path/Model2Path are the real archive paths of the base .mdx files that displayId's
-    // ItemDisplayInfo natively names in its ModelName_1/ModelName_2 fields (author-supplied, e.g.
-    // pulled from a DBC/SQL dump) -- same "known-good pair, no in-memory guesswork" convention as
-    // CreatureModelPath in WXLCreatureModels.csv. Model2Path is optional (many weapons are
-    // single-model; leave the column blank). Deliberately no Race/Gender columns at all: weapon
-    // virtual models here are never race/gender suffixed -- one baked model per DisplayID per
-    // column, full stop -- which is the whole point of moving weapons onto this creature-style
-    // path instead of EquipExtension's older per-wearer race/gender-aware weapon patch.
+    // WXLWeaponModels.csv columns: DisplayID, Model1Path, Model2Path, Geoset1, Geoset2 (Geoset1/2
+    // optional). One row per DisplayID -- Model1Path/Model2Path are the real archive paths of the
+    // base .mdx files that displayId's ItemDisplayInfo natively names in its ModelName_1/ModelName_2
+    // fields (author-supplied, e.g. pulled from a DBC/SQL dump) -- same "known-good pair, no
+    // in-memory guesswork" convention as CreatureModelPath in WXLCreatureModels.csv. Model2Path is
+    // optional (many weapons are single-model; leave the column blank). Deliberately no Race/Gender
+    // columns at all: weapon virtual models here are never race/gender suffixed -- one baked model
+    // per DisplayID per column, full stop -- which is the whole point of moving weapons onto this
+    // creature-style path instead of EquipExtension's older per-wearer race/gender-aware weapon
+    // patch.
+    //
+    // Geoset1/Geoset2 are each parsed exactly like WXLCreatureModels.csv's own "Geoset" column (see
+    // ParseWeaponGeosetSpec below) and apply only to their matching model column -- Geoset1 filters
+    // Model1Path's submeshes, Geoset2 filters Model2Path's, independently. This matters more for
+    // weapons than for creatures: Model2 is very often a wholly separate glow/particle mesh (see the
+    // Bloodfang example in WXLWeaponModels.csv), so its geoset needs are typically nothing like
+    // Model1's.
     //
     // Only DisplayIDs listed in this file are ever eligible for baking, eager or lazy -- exactly
     // the same "sidecar-only" convention as WXLCreatureModels.csv.
@@ -266,6 +274,55 @@ namespace wxl::scripts::weaponextension
         std::string path[2]; // [0]=Model1Path, [1]=Model2Path; empty string = column not in use
     };
     static std::unordered_map<uint32_t, WeaponModelPaths> g_sidecarWeaponModelPath;
+
+    // Parsed form of Geoset1/Geoset2. count == 0 means "no filter, render every geoset natively
+    // present" -- same meaning as VPathPopulate/VPathPopulateGlobal's own geoCount == 0. Cap of 16
+    // mirrors CreatureExtension's CreatureGeosetSpec::ids[16] / EquipExtension's GeosetFilter.ids[16].
+    struct WeaponGeosetSpec
+    {
+        uint16_t ids[16] = {};
+        uint32_t count   = 0;
+    };
+    struct WeaponGeosetSpecs
+    {
+        WeaponGeosetSpec spec[2]; // [0]=Geoset1 (for Model1Path), [1]=Geoset2 (for Model2Path)
+    };
+    static std::unordered_map<uint32_t, WeaponGeosetSpecs> g_sidecarWeaponGeoset;
+
+    // Parses one Geoset1/Geoset2 cell -- identical rules to CreatureExtension's
+    // ParseCreatureGeosetSpec:
+    //   empty            -> count=0, no filter applied, every geoset renders exactly as the model
+    //                       file natively has it
+    //   "0"              -> count=1, ids=[0] -- keep ONLY skinSectionId 0 (the base geoset; every
+    //                       other section gets zeroed out of the .skin bytes)
+    //   "xxxx,yyyy,..."  -> count=N+1, ids=[0, xxxx, yyyy, ...] -- geoset 0 is always implied
+    //                       alongside whatever ids are explicitly listed, same way a weapon's own
+    //                       base blade/haft geometry is never something you have to ask for
+    //                       separately; an explicit "0" in the list is just a no-op duplicate of the
+    //                       implied one, not a second entry
+    static WeaponGeosetSpec ParseWeaponGeosetSpec(const char* spec)
+    {
+        WeaponGeosetSpec f = {};
+        if (!spec || !*spec) return f; // empty column -- no filter, render every geoset
+
+        f.ids[f.count++] = 0; // base geoset is always implied once any filtering is requested at all
+
+        const char* p = spec;
+        while (*p && f.count < 16)
+        {
+            while (*p == ' ' || *p == '\t' || *p == ',') ++p;
+            if (*p < '0' || *p > '9') break;
+
+            uint32_t v = 0;
+            while (*p >= '0' && *p <= '9') v = v * 10u + static_cast<uint32_t>(*p++ - '0');
+
+            bool dup = false;
+            for (uint32_t i = 0; i < f.count; ++i)
+                if (f.ids[i] == static_cast<uint16_t>(v)) { dup = true; break; }
+            if (!dup) f.ids[f.count++] = static_cast<uint16_t>(v);
+        }
+        return f;
+    }
 
     // WXLWeaponTextures.csv columns: DisplayID, ModelColumn, TextureType, TexturePath. Multiple
     // rows per (DisplayID, ModelColumn) are expected -- one per baked texture layer (e.g. base
@@ -295,6 +352,8 @@ namespace wxl::scripts::weaponextension
         const int cDisplay = FindCsvColumn(header, "DisplayID");
         const int cModel1  = FindCsvColumn(header, "Model1Path");
         const int cModel2  = FindCsvColumn(header, "Model2Path"); // optional -- blank column is fine
+        const int cGeoset1 = FindCsvColumn(header, "Geoset1");    // optional -- absent is fine, not an error
+        const int cGeoset2 = FindCsvColumn(header, "Geoset2");    // optional -- absent is fine, not an error
 
         if (cDisplay < 0 || cModel1 < 0)
         {
@@ -331,6 +390,15 @@ namespace wxl::scripts::weaponextension
             }
 
             g_sidecarWeaponModelPath.emplace(displayId, std::move(entry));
+
+            if (cGeoset1 >= 0 || cGeoset2 >= 0)
+            {
+                WeaponGeosetSpecs geo;
+                if (cGeoset1 >= 0) geo.spec[0] = ParseWeaponGeosetSpec(CsvField(row, cGeoset1));
+                if (cGeoset2 >= 0) geo.spec[1] = ParseWeaponGeosetSpec(CsvField(row, cGeoset2));
+                g_sidecarWeaponGeoset.emplace(displayId, geo);
+            }
+
             ++loaded;
         }
 
@@ -483,18 +551,18 @@ namespace wxl::scripts::weaponextension
 
     // Bakes (displayId, modelColumn)'s patched bytes into the process-lifetime override table, if
     // the sidecar tables know a model path for that column (WXLWeaponModels.csv) and there's at
-    // least one matching texture row to bake (WXLWeaponTextures.csv) -- unlike creatures, there is
-    // no Geoset column here: weapons don't need submesh filtering, only baked texture layers. Shared
-    // by both PreregisterSidecarWeapons (eager, walks every known displayId/column at startup) and
-    // WeaponLazyResolve (lazy, one displayId/column at a time, on demand) so the bake logic only
-    // exists once.
+    // least one matching texture row (WXLWeaponTextures.csv) and/or a Geoset1/Geoset2 filter for
+    // that column to bake. Shared by both PreregisterSidecarWeapons (eager, walks every known
+    // displayId/column at startup) and WeaponLazyResolve (lazy, one displayId/column at a time, on
+    // demand) so the bake logic only exists once.
     //
-    // Deliberately requires at least one texture row before baking anything: a column with a known
-    // model path but zero texture rows has nothing this module would change versus the base model,
-    // so there is no point minting a virtual copy of it. If ItemModelData.dbc is pointed at a
-    // virtual name for such a column anyway, the resulting VirtualProvide miss simply falls through
-    // to the client's normal archive lookup of the (never-baked) virtual name and fails to load --
-    // give that column a texture row, or leave ItemModelData.dbc naming the real base model instead.
+    // Deliberately requires at least one texture row OR a non-empty Geoset1/Geoset2 entry before
+    // baking anything: a column with a known model path but nothing to actually change has nothing
+    // this module would alter versus the base model, so there is no point minting a virtual copy of
+    // it. If ItemModelData.dbc is pointed at a virtual name for such a column anyway, the resulting
+    // VirtualProvide miss simply falls through to the client's normal archive lookup of the
+    // (never-baked) virtual name and fails to load -- give that column a texture row or a geoset
+    // filter, or leave ItemModelData.dbc naming the real base model instead.
     static bool BakeWeaponDisplay(uint32_t displayId, uint32_t modelColumn)
     {
         auto pathIt = g_sidecarWeaponModelPath.find(displayId);
@@ -503,28 +571,40 @@ namespace wxl::scripts::weaponextension
 
         char matSpec[2048] = {};
         BuildWeaponMaterialPatchSpec(matSpec, sizeof(matSpec), displayId, modelColumn);
-        if (!matSpec[0])
+
+        const WeaponGeosetSpec* geoSpec = nullptr;
+        auto geoIt = g_sidecarWeaponGeoset.find(displayId);
+        if (geoIt != g_sidecarWeaponGeoset.end() && geoIt->second.spec[modelColumn].count > 0)
+            geoSpec = &geoIt->second.spec[modelColumn];
+
+        if (!matSpec[0] && !geoSpec)
         {
-            WeaponLog("  bake skipped: display=%u column=%u -- no matching texture rows",
-                      displayId, modelColumn);
+            WeaponLog("  bake skipped: display=%u column=%u -- no matching texture rows and no "
+                      "geoset filter", displayId, modelColumn);
             return false;
         }
 
         // No texPath (only materialPatchSpec) -- weapon texture rows here are all TextureType-keyed,
-        // same convention as creature texture rows. No geoset filter for weapons -- see this
-        // function's own doc comment. evictionPool="Weapon" gives weapon bakes their own budget
-        // (WXLExtendedEquipment.ini's [Memory] MaxWeaponCacheMB, default 512 if unset), tracked and
-        // enforced completely independently of CreatureExtension's MaxCreatureCacheMB pool -- a
-        // burst of newly-equipped weapons can't evict a creature's baked model, or vice versa.
+        // same convention as creature texture rows. geoSpec (from Geoset1/Geoset2) zeroes out the
+        // .skin bytes of every submesh whose skinSectionId isn't in it, same as
+        // VPathPopulate/BakeCreatureDisplay's own geoset filtering -- see ParseWeaponGeosetSpec's
+        // doc comment for the column's exact syntax. evictionPool="Weapon" gives weapon bakes their
+        // own budget (WXLExtendedEquipment.ini's [Memory] MaxWeaponCacheMB, default 512 if unset),
+        // tracked and enforced completely independently of CreatureExtension's MaxCreatureCacheMB
+        // pool -- a burst of newly-equipped weapons can't evict a creature's baked model, or vice
+        // versa.
         char vModelPath[280] = {};
         bool registered = VPathPopulateGlobal(pathIt->second.path[modelColumn].c_str(), displayId,
-                                               nullptr, matSpec, nullptr, 0,
+                                               nullptr, matSpec,
+                                               geoSpec ? geoSpec->ids : nullptr,
+                                               geoSpec ? geoSpec->count : 0,
                                                true, // evictable -- WeaponLazyResolve rebakes on miss
                                                vModelPath, sizeof(vModelPath),
                                                "Weapon");
-        WeaponLog("  bake: display=%u column=%u real='%s' vpath='%s' spec='%s' registered=%d",
+        WeaponLog("  bake: display=%u column=%u real='%s' vpath='%s' spec='%s' geoCount=%u "
+                  "registered=%d",
                   displayId, modelColumn, pathIt->second.path[modelColumn].c_str(), vModelPath,
-                  matSpec, registered ? 1 : 0);
+                  matSpec, geoSpec ? geoSpec->count : 0u, registered ? 1 : 0);
 
         // vModelPath (when registered) is the exact string to write into ItemModelData.dbc's
         // Model1/Model2 field for this displayId/column -- lowercase, .mdx already normalized to
@@ -536,8 +616,8 @@ namespace wxl::scripts::weaponextension
     }
 
     // Walks every displayId listed in WXLWeaponModels.csv and bakes both of its columns (whichever
-    // are non-empty and have matching texture rows -- see BakeWeaponDisplay) into the
-    // process-lifetime override table under the exact virtual .m2 names ItemModelData.dbc's
+    // are non-empty and have a matching texture row and/or geoset filter -- see BakeWeaponDisplay)
+    // into the process-lifetime override table under the exact virtual .m2 names ItemModelData.dbc's
     // Model1/Model2 fields already name for that displayId (patched at the data level, outside this
     // module -- see OnModelLoadPre's doc comment in WeaponExtension.hpp). No race to lose here: the
     // native loader always asks for that virtual name directly, on every equip/relog/char-select
