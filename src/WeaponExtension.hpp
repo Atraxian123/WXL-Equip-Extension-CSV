@@ -49,6 +49,12 @@ namespace wxl::scripts::weaponextension
         // native loader then always just asks for the right file on its own, eager or lazy, with no
         // race/gender variant handling (weapons here are never race/gender suffixed) and no
         // shared-row corruption risk between displayIds sharing one base model file.
+        //
+        // Bakes are registered evictable, in their own "Weapon" pool -- see VPathPopulateGlobal's
+        // evictionPool parameter in VirtualPath.hpp. Budgeted independently from
+        // CreatureExtension's pool via WXLExtendedEquipment.ini's [Memory] MaxWeaponCacheMB (default
+        // 512 MB if unset; <= 0 means uncapped). A weapon evicted for being over budget isn't gone
+        // for good: the next load of it simply misses and WeaponLazyResolve rebakes it on the spot.
         void OnModelLoadPre(const wxl::events::ModelLoadArgs& a);
     };
 }

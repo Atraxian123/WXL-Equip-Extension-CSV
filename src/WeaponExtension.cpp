@@ -512,12 +512,16 @@ namespace wxl::scripts::weaponextension
 
         // No texPath (only materialPatchSpec) -- weapon texture rows here are all TextureType-keyed,
         // same convention as creature texture rows. No geoset filter for weapons -- see this
-        // function's own doc comment.
+        // function's own doc comment. evictionPool="Weapon" gives weapon bakes their own budget
+        // (WXLExtendedEquipment.ini's [Memory] MaxWeaponCacheMB, default 512 if unset), tracked and
+        // enforced completely independently of CreatureExtension's MaxCreatureCacheMB pool -- a
+        // burst of newly-equipped weapons can't evict a creature's baked model, or vice versa.
         char vModelPath[280] = {};
         bool registered = VPathPopulateGlobal(pathIt->second.path[modelColumn].c_str(), displayId,
                                                nullptr, matSpec, nullptr, 0,
                                                true, // evictable -- WeaponLazyResolve rebakes on miss
-                                               vModelPath, sizeof(vModelPath));
+                                               vModelPath, sizeof(vModelPath),
+                                               "Weapon");
         WeaponLog("  bake: display=%u column=%u real='%s' vpath='%s' spec='%s' registered=%d",
                   displayId, modelColumn, pathIt->second.path[modelColumn].c_str(), vModelPath,
                   matSpec, registered ? 1 : 0);
