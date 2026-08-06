@@ -23,7 +23,7 @@ Needless to say, this is NOT compatible with withe either the base module or the
 - If possible, also use the Host extension.
 
 - Take the WXLExtendedEquipment.ini from the samples and instructions folder and put it into the root of the client.
-You may now select the size of the creatures models cache and disable eager loading for creatures (advised) and weapons (not advised at the moment).
+You may now select the size of the creatures models cache and disable eager loading for creatures and weapons.
 
 **NOTE: this specific module uses an event implemented in this branch of the WXL-Core, (has ben pulled into the main branch, so you might not need it anymore).**
 https://github.com/Atraxian123/wxl-core
