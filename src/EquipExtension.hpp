@@ -30,17 +30,22 @@ namespace wxl::scripts::equipextension
         void OnM2SkinFinalize(const wxl::events::M2SkinFinalizeArgs& a);
         void OnM2PerFrameUpdate(const wxl::events::M2PerFrameUpdateArgs& a);
         void OnBuildBonePalette(const wxl::events::BuildBonePaletteArgs& a);
-		void OnWeaponVisualChange(const wxl::events::WeaponVisualChangeArgs& a);	//ATRAXIAN
-        void OnItemDisplayLookup(const wxl::events::ItemDisplayLookupArgs& a);
+
+        // OnWeaponVisualChange and OnItemDisplayLookup formerly lived here, driving the old runtime
+        // weapon model-swap path (native ItemDisplayInfo lookup + live Model1/Model2 substitution).
+        // Both are removed: WeaponExtension (WeaponExtension.hpp/.cpp) now owns weapon model
+        // resolution entirely, patching ItemModelData.dbc at the data level instead, the same
+        // convention CreatureModelData already uses for creatures. This class no longer subscribes
+        // to either event -- see EquipExtension.cpp's constructor.
 
         // Not model-load-related at all -- reused purely as the earliest possible, unconditional
-        // trigger to kick the one-time weapon sidecar load + eager preregister off. OnModelLoadPre
-        // fires for ANY model init anywhere in the client, including the login/char-select glue
-        // scene's own preview models, well before OnItemSlotChange/OnWeaponVisualChange ever fire
-        // for the char-select preview character (see CreatureExtension.hpp's identical reasoning --
-        // same fix, same rationale, applied here for consistency). LoadSidecarModels is idempotent
-        // (no-op after the first call), so this is purely additive: the existing OnItemSlotChange/
-        // OnWeaponVisualChange/LookupItemDisplayId call sites stay in place as redundant safety nets.
+        // trigger to kick the one-time armor sidecar load off. OnModelLoadPre fires for ANY model
+        // init anywhere in the client, including the login/char-select glue scene's own preview
+        // models, well before OnItemSlotChange ever fires for the char-select preview character
+        // (see CreatureExtension.hpp's identical reasoning -- same fix, same rationale, applied
+        // here for consistency). LoadSidecarModels is idempotent (no-op after the first call), so
+        // this is purely additive: the existing OnItemSlotChange call site stays in place as a
+        // redundant safety net.
         void OnModelLoadPre(const wxl::events::ModelLoadArgs& a);
     };
 }

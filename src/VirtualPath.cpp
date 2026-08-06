@@ -81,9 +81,10 @@ namespace wxl::scripts::equipextension
         // REAL (unmangled, normalized) archive path -> patched bytes. Unlike g_virtualBytes,
         // these are served under the model's own real name and apply to every loader, not just
         // paths this module itself constructed. See VPathPopulateGlobal. Non-evictable entries
-        // (the default -- e.g. weapons) are permanent for the life of the process, same as before;
-        // entries registered with evictable=true (creatures) can be reclaimed by EvictOverBudget
-        // once their combined size exceeds the configured budget -- see g_evictableGroups below.
+        // (the default) are permanent for the life of the process, same as before; entries
+        // registered with evictable=true (creatures, weapons) can be reclaimed by EvictOverBudget
+        // once their pool's combined size exceeds that pool's configured budget -- see
+        // g_evictablePools below.
         std::unordered_map<std::string, std::vector<uint8_t>> g_globalOverrides;
 
         // Lazy-bake resolvers, tried in registration order on a g_globalOverrides miss. See
@@ -94,21 +95,36 @@ namespace wxl::scripts::equipextension
         // ─── Evictable-entry LRU bookkeeping ──────────────────────────────────
         //
         // Only entries registered via VPathPopulateGlobal(..., evictable=true) are tracked here at
-        // all -- non-evictable entries (weapons) never appear in these tables and are never touched
-        // by EvictOverBudget, so this whole mechanism is opt-in per bake, not global. A "group" is
+        // all -- non-evictable entries never appear in these tables and are never touched by
+        // EvictOverBudget, so this whole mechanism is opt-in per bake, not global. A "group" is
         // everything one VPathPopulateGlobal call registered (the .m2 key, plus the .skin key if a
         // skin was present) -- evicted and touched as a single unit, since serving the .m2 for a
         // displayId without its matching .skin (or vice versa) after a partial eviction would produce
         // mismatched geometry/texture data.
+        //
+        // Bookkeeping is partitioned per evictionPool (e.g. "Creature", "Weapon"): each pool has its
+        // own groups table and its own running byte total, budgeted independently via that pool's
+        // own "Max<Pool>CacheMB" ini key (see GetEvictableByteBudget). This is what keeps one
+        // feature's cache pressure from evicting another's entries -- a flood of newly-equipped
+        // weapons can fill the weapon pool without touching a single creature entry, and vice versa.
         struct EvictableGroup
         {
             std::vector<std::string> keys; // table keys this group owns (.m2, optionally .skin)
             uint64_t bytes = 0;            // combined size of those keys' bytes in g_globalOverrides
             uint64_t tick  = 0;            // last-touched tick; lower = evicted first
         };
-        std::unordered_map<std::string, EvictableGroup> g_evictableGroups; // groupId (the .m2 vKey) -> group
-        std::unordered_map<std::string, std::string> g_evictableKeyToGroup; // any owned table key -> groupId
-        uint64_t g_evictableBytesTotal = 0;
+        struct EvictablePool
+        {
+            std::unordered_map<std::string, EvictableGroup> groups; // groupId (the .m2 vKey) -> group
+            uint64_t bytesTotal = 0;
+        };
+        std::unordered_map<std::string, EvictablePool> g_evictablePools; // pool name -> pool state
+
+        // Any owned table key (the .m2 groupId itself, or its .skin key) -> (pool, groupId). Both
+        // keys of a group map to the same groupId (the .m2 vKey), so a touch on either the model or
+        // the skin key finds the same group.
+        struct EvictableKeyLoc { std::string pool; std::string groupId; };
+        std::unordered_map<std::string, EvictableKeyLoc> g_evictableKeyLoc;
         uint64_t g_evictTickCounter = 0;
 
         // Bumps an evictable group's LRU tick, if tableKey belongs to one. A no-op for any key that
@@ -116,70 +132,84 @@ namespace wxl::scripts::equipextension
         // which never go through this path at all.
         static void TouchEvictableGroup(const std::string& tableKey)
         {
-            auto kit = g_evictableKeyToGroup.find(tableKey);
-            if (kit == g_evictableKeyToGroup.end()) return;
-            auto git = g_evictableGroups.find(kit->second);
-            if (git != g_evictableGroups.end()) git->second.tick = ++g_evictTickCounter;
+            auto locIt = g_evictableKeyLoc.find(tableKey);
+            if (locIt == g_evictableKeyLoc.end()) return;
+            auto poolIt = g_evictablePools.find(locIt->second.pool);
+            if (poolIt == g_evictablePools.end()) return;
+            auto git = poolIt->second.groups.find(locIt->second.groupId);
+            if (git != poolIt->second.groups.end()) git->second.tick = ++g_evictTickCounter;
         }
 
-        // MaxCreatureCacheMB from WXLExtendedEquipment.ini's [Memory] section, cached after the first
-        // read (the ini isn't expected to change mid-session). <= 0 (including "missing" -- the
-        // default below) means no cap is enforced: entries are still tracked and touched, they're
-        // just never actually evicted. Default chosen generously; tune per deployment via the ini.
-        static uint64_t GetEvictableByteBudget()
+        // "Max<Pool>CacheMB" from WXLExtendedEquipment.ini's [Memory] section, cached per pool name
+        // after its first read (the ini isn't expected to change mid-session). <= 0 (including
+        // "missing" -- the default below) means no cap is enforced for that pool: entries are still
+        // tracked and touched, they're just never actually evicted. Default chosen generously; tune
+        // per deployment, per pool, via the ini.
+        static uint64_t GetEvictableByteBudget(const std::string& pool)
         {
-            static const uint64_t budget = []() -> uint64_t
-            {
-                const int mb = WxlIniGetInt("Memory", "MaxCreatureCacheMB", 512);
-                if (mb <= 0) return 0;
-                return static_cast<uint64_t>(mb) * 1024ull * 1024ull;
-            }();
+            static std::unordered_map<std::string, uint64_t> cache;
+            auto it = cache.find(pool);
+            if (it != cache.end()) return it->second;
+
+            char key[64];
+            std::snprintf(key, sizeof(key), "Max%sCacheMB", pool.c_str());
+            const int mb = WxlIniGetInt("Memory", key, 512);
+            const uint64_t budget = (mb <= 0) ? 0 : static_cast<uint64_t>(mb) * 1024ull * 1024ull;
+            cache.emplace(pool, budget);
             return budget;
         }
 
-        // Evicts least-recently-touched evictable groups until g_evictableBytesTotal is back under
-        // budget (or there's nothing left that's safe to evict). justBakedGroupId is the group
-        // RegisterEvictableGroup just finished inserting -- if it turns out to be both the LRU victim
-        // AND the only evictable group that exists, it's kept rather than evicted: the budget is a
-        // steady-state target, not a hard per-bake ceiling, and evicting the entry that was just
-        // requested would just force an immediate rebake on the very next load of it.
-        static void EvictOverBudget(const std::string& justBakedGroupId)
+        // Evicts least-recently-touched evictable groups within one pool until that pool's byte
+        // total is back under its own budget (or there's nothing left in it that's safe to evict).
+        // Never touches any other pool's groups. justBakedGroupId is the group RegisterEvictableGroup
+        // just finished inserting -- if it turns out to be both the LRU victim AND the only evictable
+        // group in this pool, it's kept rather than evicted: the budget is a steady-state target, not
+        // a hard per-bake ceiling, and evicting the entry that was just requested would just force an
+        // immediate rebake on the very next load of it.
+        static void EvictOverBudget(const std::string& pool, const std::string& justBakedGroupId)
         {
-            const uint64_t budget = GetEvictableByteBudget();
-            if (budget == 0) return; // uncapped
+            const uint64_t budget = GetEvictableByteBudget(pool);
+            if (budget == 0) return; // uncapped for this pool
 
-            while (g_evictableBytesTotal > budget)
+            auto poolIt = g_evictablePools.find(pool);
+            if (poolIt == g_evictablePools.end()) return;
+            EvictablePool& poolState = poolIt->second;
+
+            while (poolState.bytesTotal > budget)
             {
                 std::string victim;
                 uint64_t victimTick = UINT64_MAX;
-                for (const auto& [groupId, group] : g_evictableGroups)
+                for (const auto& [groupId, group] : poolState.groups)
                 {
                     if (group.tick < victimTick) { victimTick = group.tick; victim = groupId; }
                 }
-                if (victim.empty()) break; // nothing tracked at all
+                if (victim.empty()) break; // nothing tracked in this pool at all
 
-                if (victim == justBakedGroupId && g_evictableGroups.size() == 1) break;
+                if (victim == justBakedGroupId && poolState.groups.size() == 1) break;
 
-                auto git = g_evictableGroups.find(victim);
+                auto git = poolState.groups.find(victim);
                 for (const std::string& key : git->second.keys)
                 {
                     g_globalOverrides.erase(key);
-                    g_evictableKeyToGroup.erase(key);
+                    g_evictableKeyLoc.erase(key);
                 }
-                g_evictableBytesTotal -= git->second.bytes;
-                VPathLog("  VPathPopulateGlobal: evicted '%s' (%llu bytes, total now %llu/%llu bytes)",
-                         victim.c_str(),
+                poolState.bytesTotal -= git->second.bytes;
+                VPathLog("  VPathPopulateGlobal: evicted '%s' from pool '%s' (%llu bytes, pool total "
+                         "now %llu/%llu bytes)",
+                         victim.c_str(), pool.c_str(),
                          static_cast<unsigned long long>(git->second.bytes),
-                         static_cast<unsigned long long>(g_evictableBytesTotal),
+                         static_cast<unsigned long long>(poolState.bytesTotal),
                          static_cast<unsigned long long>(budget));
-                g_evictableGroups.erase(git);
+                poolState.groups.erase(git);
             }
         }
 
-        // Records a freshly baked (vKey, vSkin?) pair as one evictable unit and enforces the budget.
-        // Called only after both keys are already in g_globalOverrides -- bytes are measured from
-        // there rather than passed in, so this can't drift out of sync with what was actually stored.
-        static void RegisterEvictableGroup(const std::string& vKey, const std::string& vSkin, bool hasSkin)
+        // Records a freshly baked (vKey, vSkin?) pair as one evictable unit in the given pool and
+        // enforces that pool's budget. Called only after both keys are already in g_globalOverrides --
+        // bytes are measured from there rather than passed in, so this can't drift out of sync with
+        // what was actually stored.
+        static void RegisterEvictableGroup(const std::string& pool, const std::string& vKey,
+                                           const std::string& vSkin, bool hasSkin)
         {
             EvictableGroup group;
             group.keys.push_back(vKey);
@@ -191,12 +221,13 @@ namespace wxl::scripts::equipextension
             }
             group.tick = ++g_evictTickCounter;
 
-            g_evictableBytesTotal += group.bytes;
+            EvictablePool& poolState = g_evictablePools[pool];
+            poolState.bytesTotal += group.bytes;
             for (const std::string& key : group.keys)
-                g_evictableKeyToGroup[key] = vKey;
-            g_evictableGroups[vKey] = std::move(group); // overwrite is fine: same-pair rebake, same size class
+                g_evictableKeyLoc[key] = EvictableKeyLoc{ pool, vKey };
+            poolState.groups[vKey] = std::move(group); // overwrite is fine: same-pair rebake, same size class
 
-            EvictOverBudget(vKey);
+            EvictOverBudget(pool, vKey);
         }
 
         // ─── Key building ─────────────────────────────────────────────────────
@@ -883,7 +914,8 @@ namespace wxl::scripts::equipextension
     bool VPathPopulateGlobal(const char* realMdxPath, uint32_t itemDisplayId,
                              const char* texPath, const char* materialPatchSpec,
                              const uint16_t* geoIds, uint32_t geoCount, bool evictable,
-                             char* outVirtualPath, size_t outVirtualPathSz)
+                             char* outVirtualPath, size_t outVirtualPathSz,
+                             const char* evictionPool)
     {
         if (!realMdxPath || !*realMdxPath) return false;
         const bool hasTexPath = texPath && *texPath;
@@ -964,7 +996,10 @@ namespace wxl::scripts::equipextension
             g_globalOverrides.emplace(vSkin, std::move(skinBytes));
 
         if (evictable)
-            RegisterEvictableGroup(vKey, vSkin, hasSkin);
+        {
+            const std::string pool = (evictionPool && *evictionPool) ? evictionPool : "Creature";
+            RegisterEvictableGroup(pool, vKey, vSkin, hasSkin);
+        }
 
         return true;
     }

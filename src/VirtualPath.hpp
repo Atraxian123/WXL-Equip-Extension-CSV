@@ -139,13 +139,28 @@ namespace wxl::scripts::equipextension
      * @param outVirtualPath     optional destination buffer that receives the virtual path the
      *                           patched bytes were registered under (e.g. "...\\model_12345.m2")
      * @param outVirtualPathSz   size in bytes of outVirtualPath
+     * @param evictionPool       which independent eviction budget this evictable=true bake counts
+     *                           against, e.g. "Creature" or "Weapon". Each distinct pool name gets
+     *                           its own LRU group table, its own running byte total, and its own
+     *                           budget read from WXLExtendedEquipment.ini's [Memory] section under
+     *                           the key "Max<Pool>CacheMB" (e.g. "MaxCreatureCacheMB",
+     *                           "MaxWeaponCacheMB") -- see GetEvictableByteBudget in
+     *                           VirtualPath.cpp. Pools never evict each other: a burst of weapon
+     *                           bakes filling the weapon pool cannot push a creature entry out, and
+     *                           vice versa, so one busy feature's cache pressure can't starve
+     *                           another's. Ignored entirely when evictable is false. Defaults to
+     *                           "Creature" for source compatibility with every caller written
+     *                           before this parameter existed (CreatureExtension.cpp's calls, in
+     *                           particular, are unchanged and keep reading MaxCreatureCacheMB
+     *                           exactly as before); WeaponExtension.cpp passes "Weapon" explicitly.
      * @return true if the override was registered (or was already registered for this path/id pair)
      */
     bool VPathPopulateGlobal(const char* realMdxPath, uint32_t itemDisplayId,
                              const char* texPath, const char* materialPatchSpec,
                              const uint16_t* geoIds = nullptr, uint32_t geoCount = 0,
                              bool evictable = false,
-                             char* outVirtualPath = nullptr, size_t outVirtualPathSz = 0);
+                             char* outVirtualPath = nullptr, size_t outVirtualPathSz = 0,
+                             const char* evictionPool = "Creature");
 
     /**
      * @brief Signature for a lazy-bake resolver registered via VPathRegisterLazyResolver.

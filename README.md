@@ -8,6 +8,7 @@ Uses .csv sidecars to declare the extra textures newer models have.
 
 This was a personal project that branched off the main equip extension in order to allow players (me in particular) to use custom models for armors/weapons and/or custom texture variations and still have the funcionality for the extra textures those models may rquire.
 Since the original equip extensions at the time was not working for weapons and the db2 powered version is quite hard to use for injecting new models with multiple changeable textures, this side branch was born.
+Since I was at it, creatures support was added.
 
 This is mainly aimed at people who want to implement custom models in an easy way. 
 If you are interested only in running the retail stuff in your client, then the base module or the db2 module are the better choice.
@@ -22,7 +23,7 @@ Needless to say, this is NOT compatible with withe either the base module or the
 - If possible, also use the Host extension.
 
 - Take the WXLExtendedEquipment.ini from the samples and instructions folder and put it into the root of the client.
-You may now select the size of the creatures models cache and disable eager loading for creatures (advised) and weapons (not advised at the moment).
+You may now select the size of the creatures models cache and disable eager loading for creatures and weapons.
 
 **NOTE: this specific module uses an event implemented in this branch of the WXL-Core, (has ben pulled into the main branch, so you might not need it anymore).**
 https://github.com/Atraxian123/wxl-core
@@ -121,6 +122,10 @@ Sidecars are searched in:
 - `DBFilesClient\WXLCreatureModels.csv`
 - `WXLCreatureTextures.csv`
 - `DBFilesClient\WXLCreatureTextures.csv`
+- `WXLWeaponModels.csv`
+- `DBFilesClient\WXLWeaponModels.csv`
+- `WXLWeaponTextures.csv`
+- `DBFilesClient\WXLWeaponTextures.csv`
 
 - the same `DBFilesClient\...` paths inside every `Data\*.MPQ` patch, including open-folder `.MPQ` patches
 
@@ -207,6 +212,35 @@ For example: creature\manawyrm2mount\manawyrm2mount.mdx with display ID 33113 wi
 Otherwise the new virtual model will be pre-loaded, but never used by the client.
 
 The corresponding CreatureDisplayInfo.dbc etry will have to specify the correct model id from the CreatureModelData.dbc.
+
+### `WXLWeaponModels.csv`
+
+Sidecar used to declare weapon models to bake and their geosets
+
+| Column | Meaning |
+|--------|---------|
+| `DisplayID` | item display ID entry as in the ItemDisplayInfo.dbc |
+| `ModelPath` | full path of the model to use for pre-loading ending with the .mdx extension |
+| `Model2Path` | full path of the model to use for pre-loading ending with the .mdx extension |
+| `Geoset1` | geosets of the model 1 that will be rendered: empty for all geosets, 0 for only the base skin geosets, "xxxx, yyyy, ..." to render multiple geosets |
+| `Geoset1` | geosets of the model 2 that will be rendered: empty for all geosets, 0 for only the base skin geosets, "xxxx, yyyy, ..." to render multiple geosets |
+
+Generally weapons only have 1 model and only skin geosets, but I wanted to give the option to modders to make complex weapons if they wanted.
+
+### `WXLWeaponTextures.csv`
+
+Sidecar for declaring the textures to bake into the weapons
+
+| Column | Meaning |
+|--------|---------|
+| `DisplayID` | item display ID entry as in the ItemDisplayInfo.dbc |
+| `ModelColumn` | 0 or 1 depending if the textures must be baked on the first or second model declared in the previous .csv |
+| `TextureType` | Texture Type of the texture to be baked. See tables below for reference. |
+| `TexturePath` | full path of the texture file to be baked |
+
+### `Changes to the ItemDisplayInfo.dbc`
+
+In order to make lazy loading and eviction logic for weapons to work, you must add a suffix to the model name similar to creatures: for example, staff_2h_ulatek_d_01.mdx on itemdisplayID = 71027 becomes staff_2h_ulatek_d_01_71027.mdx
 
 ---
 
