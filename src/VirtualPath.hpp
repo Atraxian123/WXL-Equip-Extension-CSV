@@ -19,8 +19,18 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "wxl/PluginApi.h"
+
 namespace wxl::scripts::equipextension
 {
+    /**
+     * @brief Registers VirtualProvide with the core's storage-provider hook via the extension API
+     *        table. Replaces the old self-registering global (see VirtualPath.cpp's removed
+     *        detail::Registrar). MUST be called from WXL_Load(), after
+     *        wxl::ext::EventScript::Bind(api) -- see EquipExtension.cpp.
+     */
+    void VPathRegisterStorageProvider(const WXL_Api* api);
+
     /**
      * @brief Builds the virtual .mdx key for a collection M2 into out[outSz].
      *

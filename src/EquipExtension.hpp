@@ -15,11 +15,15 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 #pragma once
-#include "events/EventScript.hpp"
+#define WXL_EXTENSION 1
+#include "wxl/PluginApi.h"
+#include "wxl/EventScript.hpp"
+
+#include "engine/events/Event.hpp"
 
 namespace wxl::scripts::equipextension
 {
-    class EquipExtension : public wxl::events::EventScript
+    class EquipExtension : public wxl::ext::EventScript
     {
     public:
         EquipExtension();

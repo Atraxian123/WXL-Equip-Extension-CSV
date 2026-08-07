@@ -15,18 +15,16 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 #include "EquipExtension.hpp"
+#include "CreatureExtension.hpp"
+#include "WeaponExtension.hpp"
+#include "WxlOffsets.hpp"
 #include "VirtualPath.hpp"
-#include "core/Logger.hpp"
-#include "events/Event.hpp"
+#include "common/Log.hpp"
+#include "engine/events/Event.hpp"
 #include "game/Binding.hpp"
-#include "game/io/Io.hpp"
-#include "game/m2/M2.hpp"
-#include "game/unit/Unit.hpp"
-#include "offsets/engine/Io.hpp"
-#include "offsets/game/DB2.hpp"
-#include "offsets/game/M2.hpp"
-#include "offsets/game/Unit.hpp"
-#include "runtime/GameHooks.hpp"
+#include "game/Io.hpp"
+#include "game/M2.hpp"
+#include "game/Unit.hpp"
 
 #include <windows.h>
 
@@ -44,9 +42,6 @@
 namespace wxl::scripts::equipextension
 {
     namespace ev   = wxl::events;
-    namespace m2   = wxl::offsets::game::m2;
-    namespace db2  = wxl::offsets::game::db2;
-    namespace unit = wxl::offsets::game::unit;
     namespace gm2  = wxl::game::m2;
     using wxl::game::Native;
 
@@ -360,9 +355,9 @@ namespace wxl::scripts::equipextension
                 uint8_t ci = remap.collToChar[bi];
                 if (ci == 0xFF) continue;
 
-                std::memcpy(dstBuf + bi * m2::kBonePaletteStride,
-                            srcBuf + ci * m2::kBonePaletteStride,
-                            m2::kBonePaletteStride);
+                std::memcpy(dstBuf + bi * offsets::kBonePaletteStride,
+                            srcBuf + ci * offsets::kBonePaletteStride,
+                            offsets::kBonePaletteStride);
             }
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
@@ -396,24 +391,24 @@ namespace wxl::scripts::equipextension
             auto* collBytes = reinterpret_cast<uint8_t*>(collRc);
             auto* charBytes = reinterpret_cast<uint8_t*>(charRc);
 
-            void* collM2  = *reinterpret_cast<void**>(collBytes + m2::kOffInstModel);
-            void* charM2  = *reinterpret_cast<void**>(charBytes + m2::kOffInstModel);
+            void* collM2  = *reinterpret_cast<void**>(collBytes + offsets::kOffInstModel);
+            void* charM2  = *reinterpret_cast<void**>(charBytes + offsets::kOffInstModel);
             if (!collM2 || !charM2) return r;
 
 
             // M2AnimData = raw M2 file buffer = M2FileHeader (at m2_inst+0x150)
-            auto* collHdr = *reinterpret_cast<uint8_t**>(reinterpret_cast<uint8_t*>(collM2) + m2::kOffModelHeader);
-            auto* charHdr = *reinterpret_cast<uint8_t**>(reinterpret_cast<uint8_t*>(charM2) + m2::kOffModelHeader);
+            auto* collHdr = *reinterpret_cast<uint8_t**>(reinterpret_cast<uint8_t*>(collM2) + offsets::kOffModelHeader);
+            auto* charHdr = *reinterpret_cast<uint8_t**>(reinterpret_cast<uint8_t*>(charM2) + offsets::kOffModelHeader);
             if (!collHdr || !charHdr) return r;
 
-            uint32_t collN    = *reinterpret_cast<uint32_t*>(collHdr + m2::kOffHdrBoneCount);
-            uint8_t* collBase = *reinterpret_cast<uint8_t**>(collHdr + m2::kOffHdrBoneArray);
+            uint32_t collN    = *reinterpret_cast<uint32_t*>(collHdr + offsets::kOffHdrBoneCount);
+            uint8_t* collBase = *reinterpret_cast<uint8_t**>(collHdr + offsets::kOffHdrBoneArray);
 
-            uint32_t charN    = *reinterpret_cast<uint32_t*>(charHdr + m2::kOffHdrBoneCount);
-            uint8_t* charBase = *reinterpret_cast<uint8_t**>(charHdr + m2::kOffHdrBoneArray);
+            uint32_t charN    = *reinterpret_cast<uint32_t*>(charHdr + offsets::kOffHdrBoneCount);
+            uint8_t* charBase = *reinterpret_cast<uint8_t**>(charHdr + offsets::kOffHdrBoneArray);
 
-            uint32_t charLutN = *reinterpret_cast<uint32_t*>(charHdr + m2::kOffHdrBoneIdxLutCount);
-            int16_t* charLut  = *reinterpret_cast<int16_t**>(charHdr + m2::kOffHdrBoneIdxLutPtr);
+            uint32_t charLutN = *reinterpret_cast<uint32_t*>(charHdr + offsets::kOffHdrBoneIdxLutCount);
+            int16_t* charLut  = *reinterpret_cast<int16_t**>(charHdr + offsets::kOffHdrBoneIdxLutPtr);
 
           //  EquipLog("  BuildBoneRemap: collN=%u charN=%u collBase=%p charBase=%p charLut=%p",
           //           collN, charN, collBase, charBase, charLut);
@@ -426,11 +421,11 @@ namespace wxl::scripts::equipextension
                 for (uint32_t i = 0; i < collN; ++i)
                 {
                     if (r.collToChar[i] != 0xFF) continue;
-                    uint32_t collCrc = *reinterpret_cast<uint32_t*>(collBase + i * m2::kBoneStride + m2::kOffBoneNameCrc);
+                    uint32_t collCrc = *reinterpret_cast<uint32_t*>(collBase + i * offsets::kBoneStride + offsets::kOffBoneNameCrc);
                     if (collCrc == 0) continue;
                     for (uint32_t j = 0; j < charN && j < 255; ++j)
                     {
-                        uint32_t charCrc = *reinterpret_cast<uint32_t*>(charBase + j * m2::kBoneStride + m2::kOffBoneNameCrc);
+                        uint32_t charCrc = *reinterpret_cast<uint32_t*>(charBase + j * offsets::kBoneStride + offsets::kOffBoneNameCrc);
                         if (charCrc == collCrc) { r.collToChar[i] = static_cast<uint8_t>(j); break; }
                     }
                 }
@@ -442,11 +437,11 @@ namespace wxl::scripts::equipextension
             {
                 for (uint32_t i = 0; i < collN; ++i)
                 {
-                    int32_t key = *reinterpret_cast<int32_t*>(collBase + i * m2::kBoneStride + m2::kOffBoneKeyId);
+                    int32_t key = *reinterpret_cast<int32_t*>(collBase + i * offsets::kBoneStride + offsets::kOffBoneKeyId);
                     if (key < 0) continue;
                     for (uint32_t j = 0; j < charN && j < 255; ++j)
                     {
-                        if (*reinterpret_cast<int32_t*>(charBase + j * m2::kBoneStride + m2::kOffBoneKeyId) == key)
+                        if (*reinterpret_cast<int32_t*>(charBase + j * offsets::kBoneStride + offsets::kOffBoneKeyId) == key)
                         {
                             r.collToChar[i] = static_cast<uint8_t>(j);
                             break;
@@ -461,7 +456,7 @@ namespace wxl::scripts::equipextension
                 for (uint32_t i = 0; i < collN; ++i)
                 {
                     if (r.collToChar[i] != 0xFF) continue;
-                    int32_t key = *reinterpret_cast<int32_t*>(collBase + i * m2::kBoneStride + m2::kOffBoneKeyId);
+                    int32_t key = *reinterpret_cast<int32_t*>(collBase + i * offsets::kBoneStride + offsets::kOffBoneKeyId);
                     if (key < 0 || static_cast<uint32_t>(key) >= charLutN) continue;
                     int16_t ci = charLut[key];
                     if (ci >= 0 && static_cast<uint32_t>(ci) < charN && ci < 255)
@@ -476,7 +471,7 @@ namespace wxl::scripts::equipextension
                 for (uint32_t i = 0; i < collN; ++i)
                 {
                     if (r.collToChar[i] != 0xFF) continue;
-                    int16_t parent = *reinterpret_cast<int16_t*>(collBase + i * m2::kBoneStride + m2::kOffBoneParent);
+                    int16_t parent = *reinterpret_cast<int16_t*>(collBase + i * offsets::kBoneStride + offsets::kOffBoneParent);
                     if (parent < 0 || static_cast<uint32_t>(parent) >= collN) continue;
                     if (r.collToChar[parent] != 0xFF)
                     {
@@ -1005,10 +1000,9 @@ namespace wxl::scripts::equipextension
         }
 
         namespace io    = wxl::game::io;
-        namespace iooff = wxl::offsets::engine::io;
 
         void* handle = nullptr;
-        if (!io::FileOpen(path, iooff::kOpenWholeFile, &handle) || !handle)
+        if (!io::FileOpen(path, offsets::io::kOpenWholeFile, &handle) || !handle)
             return false;
 
         uint32_t sizeHigh = 0;
@@ -1458,7 +1452,7 @@ namespace wxl::scripts::equipextension
         if (it == g_attached.end()) return;
 
         // Current live sub_obj (read fresh; may differ from stored sub_obj after re-login).
-        void* curSubObj = GuardedReadPtr(reinterpret_cast<uint8_t*>(cmo) + m2::kOffCmoSceneNode);
+        void* curSubObj = GuardedReadPtr(reinterpret_cast<uint8_t*>(cmo) + offsets::kOffCmoSceneNode);
 
         struct DetachPair { void* subObj; uint32_t attachId; };
         DetachPair pairs[8]; uint32_t nPairs = 0;
@@ -1495,7 +1489,7 @@ namespace wxl::scripts::equipextension
         if (it == g_attached.end() || it->second.empty()) return;
         auto& entries = it->second;
 
-        void* subObj = GuardedReadPtr(reinterpret_cast<uint8_t*>(cmo) + m2::kOffCmoSceneNode);
+        void* subObj = GuardedReadPtr(reinterpret_cast<uint8_t*>(cmo) + offsets::kOffCmoSceneNode);
         if (!subObj) { EquipLog("  RebuildAllModels: subObj null, bail"); return; }
 
         // GetRenderCtx (sub_81f8f0) must be called with the scene-node's owner (owner28), NOT
@@ -1505,7 +1499,7 @@ namespace wxl::scripts::equipextension
         // how vanilla's sub_4eaa70 calls sub_81f8f0: it dereferences *(sub_obj+0x28) first.
         // If owner28 is null the CMO is not yet fully initialised; bail so OnM2PerFrameUpdate
         // can retry via the pending-attach sweep.
-        void* owner28 = GuardedReadPtr(reinterpret_cast<uint8_t*>(subObj) + m2::kOffSceneNodeOwner);
+        void* owner28 = GuardedReadPtr(reinterpret_cast<uint8_t*>(subObj) + offsets::kOffSceneNodeOwner);
         if (!owner28) { EquipLog("  RebuildAllModels: owner28 null, bail (deferred)"); return; }
 
         EquipLog("  RebuildAllModels: %zu entries, subObj=0x%p owner28=0x%p",
@@ -1694,7 +1688,7 @@ namespace wxl::scripts::equipextension
             // BoneIndicesByID LUT; if the attach point is absent and zero2==0 it exits silently.
             // Passing forceAttach=true (zero2=1) bypasses the early-exit for non-standard points
             // (e.g. attach_id=19) that collection M2s use.
-            uint32_t subInitFlags = GuardedReadU32(reinterpret_cast<uint8_t*>(subObj) + m2::kOffInstInitFlags);
+            uint32_t subInitFlags = GuardedReadU32(reinterpret_cast<uint8_t*>(subObj) + offsets::kOffInstInitFlags);
             EquipLog("  Phase3[%zu] attach=%u rctx=0x%p subObj_initFlags=0x%X isCollection=%d",
                      i, e.attachId, rctx, subInitFlags, (int)isCollection);
             gm2::AttachToScene(rctx, subObj, e.attachId, isCollection);
@@ -1732,7 +1726,7 @@ namespace wxl::scripts::equipextension
                          merged.count > 1 ? merged.ids[1] : 0,
                          merged.count > 2 ? merged.ids[2] : 0,
                          merged.count > 3 ? merged.ids[3] : 0);
-                void* mdl = GuardedReadPtr(reinterpret_cast<uint8_t*>(rctx) + m2::kOffInstModel);
+                void* mdl = GuardedReadPtr(reinterpret_cast<uint8_t*>(rctx) + offsets::kOffInstModel);
                 auto* skin = mdl ? gm2::Skin(mdl) : nullptr;
                 if (skin)
                 {
@@ -1803,7 +1797,7 @@ namespace wxl::scripts::equipextension
         const SlotConfig& cfg = kSlotConfig[a.modelSlot];
 
         void* cmo = a.charModelObj;
-        void* subObj = GuardedReadPtr(reinterpret_cast<uint8_t*>(cmo) + m2::kOffCmoSceneNode);
+        void* subObj = GuardedReadPtr(reinterpret_cast<uint8_t*>(cmo) + offsets::kOffCmoSceneNode);
 
         // Unequip path: display_id == 0 when the slot is being cleared via the equip hook.
         uint32_t displayId = 0;
@@ -1821,12 +1815,18 @@ namespace wxl::scripts::equipextension
             return;
         }
 
-        // Look up the ItemDisplayInfo record. Uses the native trampoline, not the live-hooked
-        // kLookup address, for the same reason as PatchWeaponModelByDisplayId above -- this needs
-        // the true native fields, not whatever a weapon-slot override may have substituted for some
-        // other display id.
-        alignas(4) uint8_t dispBuf[db2::itemdisplayinfo::kRecordSize] = {};
-        uint32_t ok = wxl::runtime::game::ItemDisplayInfoLookupNative(displayId, dispBuf);
+        // Look up the ItemDisplayInfo record. Calls the native storage lookup directly by address
+        // (offsets::itemdisplayinfo::kLookup) rather than through the core's internal
+        // wxl::runtime::game::ItemDisplayInfoLookupNative trampoline, which extensions cannot reach
+        // (see PORTING_GUIDE.md: "Extensions cannot call core functions directly"). This is a direct
+        // call into the client's own already-mapped code -- the same category as an SDK facade
+        // reading the fixed-base image -- not a hook, so no HookAttach/original chain is involved.
+        // Needs the true native fields, not whatever a weapon-slot override may have substituted for
+        // some other display id, same reasoning as PatchWeaponModelByDisplayId above.
+        alignas(4) uint8_t dispBuf[offsets::itemdisplayinfo::kRecordSize] = {};
+        auto lookupFn = reinterpret_cast<offsets::itemdisplayinfo::LookupFn>(offsets::itemdisplayinfo::kLookup);
+        void* storageObj = reinterpret_cast<void*>(offsets::itemdisplayinfo::kStorageObject);
+        uint32_t ok = lookupFn(storageObj, nullptr, displayId, dispBuf);
         const char* modelName1 = nullptr;
         const char* modelName2 = nullptr;
         const char* texName1   = nullptr;
@@ -1834,11 +1834,11 @@ namespace wxl::scripts::equipextension
         const char* icon2str   = nullptr;
         if (ok)
         {
-            modelName1 = *reinterpret_cast<const char**>(dispBuf + db2::itemdisplayinfo::kOffModel1);
-            modelName2 = *reinterpret_cast<const char**>(dispBuf + db2::itemdisplayinfo::kOffModel2);
-            texName1   = *reinterpret_cast<const char**>(dispBuf + db2::itemdisplayinfo::kOffTex1);
-            texName2   = *reinterpret_cast<const char**>(dispBuf + db2::itemdisplayinfo::kOffTex2);
-            icon2str   = *reinterpret_cast<const char**>(dispBuf + db2::itemdisplayinfo::kOffIcon2);
+            modelName1 = *reinterpret_cast<const char**>(dispBuf + offsets::itemdisplayinfo::kOffModel1);
+            modelName2 = *reinterpret_cast<const char**>(dispBuf + offsets::itemdisplayinfo::kOffModel2);
+            texName1   = *reinterpret_cast<const char**>(dispBuf + offsets::itemdisplayinfo::kOffTex1);
+            texName2   = *reinterpret_cast<const char**>(dispBuf + offsets::itemdisplayinfo::kOffTex2);
+            icon2str   = *reinterpret_cast<const char**>(dispBuf + offsets::itemdisplayinfo::kOffIcon2);
             EquipLog("  DBC ok: model1='%s' model2='%s' tex1='%s' tex2='%s' icon2ptr=0x%p icon2='%s'",
                      modelName1 ? modelName1 : "(null)", modelName2 ? modelName2 : "(null)",
                      texName1 ? texName1 : "(null)", texName2 ? texName2 : "(null)",
@@ -1878,15 +1878,15 @@ namespace wxl::scripts::equipextension
                  attachA, attachB, icon2flags, customFolder[0] ? customFolder : "(default)");
 
         // ChrRaces lookup for race code and gender string.
-        uint32_t raceId = GuardedReadU32(reinterpret_cast<uint8_t*>(cmo) + m2::kOffCmoRace);
-        uint32_t low    = *reinterpret_cast<uint32_t*>(db2::chrraces::kMinId);
-        uint32_t high   = *reinterpret_cast<uint32_t*>(db2::chrraces::kMaxId);
+        uint32_t raceId = GuardedReadU32(reinterpret_cast<uint8_t*>(cmo) + offsets::kOffCmoRace);
+        uint32_t low    = *reinterpret_cast<uint32_t*>(offsets::chrraces::kMinId);
+        uint32_t high   = *reinterpret_cast<uint32_t*>(offsets::chrraces::kMaxId);
         if (raceId < low || raceId > high)
         {
             EquipLog("  raceId=%u out of range [%u,%u], bail", raceId, low, high);
             return;
         }
-        uint8_t* idTable = *reinterpret_cast<uint8_t**>(db2::chrraces::kIdTable);
+        uint8_t* idTable = *reinterpret_cast<uint8_t**>(offsets::chrraces::kIdTable);
         void*    chrRec  = *reinterpret_cast<void**>(idTable + (raceId - low) * sizeof(void*));
         if (!chrRec)
         {
@@ -1894,9 +1894,9 @@ namespace wxl::scripts::equipextension
             return;
         }
 
-        const char* raceCode  = *reinterpret_cast<const char**>(reinterpret_cast<uint8_t*>(chrRec) + db2::chrraces::kOffRecordPrefix);
-        uint32_t    genderIdx = GuardedReadU32(reinterpret_cast<uint8_t*>(cmo) + m2::kOffCmoGender);
-        const char* genderStr = *reinterpret_cast<const char**>(db2::genderstrings::kTable + genderIdx * sizeof(void*));
+        const char* raceCode  = *reinterpret_cast<const char**>(reinterpret_cast<uint8_t*>(chrRec) + offsets::chrraces::kOffRecordPrefix);
+        uint32_t    genderIdx = GuardedReadU32(reinterpret_cast<uint8_t*>(cmo) + offsets::kOffCmoGender);
+        const char* genderStr = *reinterpret_cast<const char**>(offsets::genderstrings::kTable + genderIdx * sizeof(void*));
         if (!raceCode || !genderStr)
         {
             EquipLog("  raceCode or genderStr null (raceCode=0x%p genderStr=0x%p), bail",
@@ -2148,7 +2148,7 @@ namespace wxl::scripts::equipextension
 
         DetachSlotEntries(cmo, modelSlot);
 
-        void* subObj = GuardedReadPtr(reinterpret_cast<uint8_t*>(cmo) + m2::kOffCmoSceneNode);
+        void* subObj = GuardedReadPtr(reinterpret_cast<uint8_t*>(cmo) + offsets::kOffCmoSceneNode);
         if (subObj) RebuildAllModels(cmo);
     }
 
@@ -2167,7 +2167,7 @@ namespace wxl::scripts::equipextension
         // Without purging, a stale entry can mistakenly match a reused CMO address.
         for (auto it = g_attached.begin(); it != g_attached.end(); )
         {
-            void* sub = GuardedReadPtr(reinterpret_cast<uint8_t*>(it->first) + m2::kOffCmoSceneNode);
+            void* sub = GuardedReadPtr(reinterpret_cast<uint8_t*>(it->first) + offsets::kOffCmoSceneNode);
             if (!sub)
             {
                 void* deadCmo = it->first;
@@ -2188,7 +2188,7 @@ namespace wxl::scripts::equipextension
         // before collBuf becomes non-null.
         for (auto& [cmo, entries] : g_attached)
         {
-            void* sceneNode = GuardedReadPtr(reinterpret_cast<uint8_t*>(cmo) + m2::kOffCmoSceneNode);
+            void* sceneNode = GuardedReadPtr(reinterpret_cast<uint8_t*>(cmo) + offsets::kOffCmoSceneNode);
             if (sceneNode != renderCtx) continue;
 
             bool hasPending = false;
@@ -2198,7 +2198,7 @@ namespace wxl::scripts::equipextension
 
             // charBuf: character bone palette. Valid when the character model is rendering.
             auto* charBuf = reinterpret_cast<uint8_t*>(
-                GuardedReadPtr(reinterpret_cast<uint8_t*>(renderCtx) + m2::kOffInstBonePalette));
+                GuardedReadPtr(reinterpret_cast<uint8_t*>(renderCtx) + offsets::kOffInstBonePalette));
             if (charBuf)
             {
                 for (auto& entry : entries)
@@ -2206,14 +2206,14 @@ namespace wxl::scripts::equipextension
                     if (!IsCollectionEntry(entry)) continue;
                     if (!entry.renderCtx || entry.boneRemap.count == 0) continue;
                     auto* collBuf = reinterpret_cast<uint8_t*>(
-                        GuardedReadPtr(reinterpret_cast<uint8_t*>(entry.renderCtx) + m2::kOffInstBonePalette));
+                        GuardedReadPtr(reinterpret_cast<uint8_t*>(entry.renderCtx) + offsets::kOffInstBonePalette));
                     if (!collBuf) continue;
                     if (!entry.charSweepApplied)
                     {
                         uint32_t charInitF = GuardedReadU32(
-                            reinterpret_cast<uint8_t*>(renderCtx) + m2::kOffInstInitFlags);
+                            reinterpret_cast<uint8_t*>(renderCtx) + offsets::kOffInstInitFlags);
                         uint32_t collInitF = GuardedReadU32(
-                            reinterpret_cast<uint8_t*>(entry.renderCtx) + m2::kOffInstInitFlags);
+                            reinterpret_cast<uint8_t*>(entry.renderCtx) + offsets::kOffInstInitFlags);
                         EquipLog("  CharSweep(bone): rctx=0x%p charInitFlags=0x%X collBuf=0x%p collInitFlags=0x%X -> APPLYING",
                                  entry.renderCtx, charInitF, static_cast<void*>(collBuf), collInitF);
                         entry.charSweepApplied = true;
@@ -2248,12 +2248,12 @@ namespace wxl::scripts::equipextension
                 // Liveness check: DetachSlot zeroes the model pointer (render_ctx+0x2c) without
                 // freeing the render_ctx allocation. If evicted (by vanilla slot handlers sharing
                 // the same attach point), re-attach immediately.
-                void* m2Live = GuardedReadPtr(reinterpret_cast<uint8_t*>(renderCtx) + m2::kOffInstModel);
+                void* m2Live = GuardedReadPtr(reinterpret_cast<uint8_t*>(renderCtx) + offsets::kOffInstModel);
                 if (!m2Live)
                 {
                     // Use owner28 (scene-node's back-pointer to its owning CMO) for GetRenderCtx,
                     // not the slot-dispatch 'cmo'. See RebuildAllModels for the full explanation.
-                    void* owner28 = GuardedReadPtr(reinterpret_cast<uint8_t*>(entry.subObj) + m2::kOffSceneNodeOwner);
+                    void* owner28 = GuardedReadPtr(reinterpret_cast<uint8_t*>(entry.subObj) + offsets::kOffSceneNodeOwner);
                     if (owner28 && entry.keyBuf[0])
                     {
                         // SafeGetRenderCtx guards against dangling hash-table buckets (same
@@ -2303,7 +2303,7 @@ namespace wxl::scripts::equipextension
                 // The collection M2's bone buffer is overwritten with corresponding char matrices.
                 if (!IsCollectionEntry(entry)) return;
                 if (entry.boneRemap.count == 0) return;													   
-                void* charCtx = GuardedReadPtr(reinterpret_cast<uint8_t*>(cmo) + m2::kOffCmoSceneNode);
+                void* charCtx = GuardedReadPtr(reinterpret_cast<uint8_t*>(cmo) + offsets::kOffCmoSceneNode);
                 if (charCtx && charCtx != renderCtx)
                 {
                     BoneRemap& remap = entry.boneRemap;
@@ -2363,13 +2363,13 @@ namespace wxl::scripts::equipextension
                     }
 
                     auto* charBuf = reinterpret_cast<uint8_t*>(
-                        GuardedReadPtr(reinterpret_cast<uint8_t*>(charCtx) + m2::kOffInstBonePalette));
+                        GuardedReadPtr(reinterpret_cast<uint8_t*>(charCtx) + offsets::kOffInstBonePalette));
                     auto* collBuf = reinterpret_cast<uint8_t*>(
-                        GuardedReadPtr(reinterpret_cast<uint8_t*>(renderCtx) + m2::kOffInstBonePalette));
+                        GuardedReadPtr(reinterpret_cast<uint8_t*>(renderCtx) + offsets::kOffInstBonePalette));
 
                     if (!entry.perFrameLogged)
                     {
-                        uint32_t collInitF = GuardedReadU32(reinterpret_cast<uint8_t*>(renderCtx) + m2::kOffInstInitFlags);
+                        uint32_t collInitF = GuardedReadU32(reinterpret_cast<uint8_t*>(renderCtx) + offsets::kOffInstInitFlags);
                         uint32_t xff = 0;
                         for (uint32_t bi = 0; bi < remap.count; ++bi)
                             if (remap.collToChar[bi] == 0xFF) ++xff;
@@ -2426,7 +2426,7 @@ namespace wxl::scripts::equipextension
             {
                 if (!entry.renderCtx || !IsCollectionEntry(entry)) continue;
                 void* entryModel = GuardedReadPtr(
-                    reinterpret_cast<uint8_t*>(entry.renderCtx) + m2::kOffInstModel);
+                    reinterpret_cast<uint8_t*>(entry.renderCtx) + offsets::kOffInstModel);
                 if (entryModel != model) continue;
 
                 GeosetFilter merged = {};
@@ -2457,7 +2457,7 @@ namespace wxl::scripts::equipextension
                 // OnM2SkinFinalize is the earliest moment entry.renderCtx is valid and the
                 // collection model is parsed. PerFrame retries if collBuf is still null here.
                 void* charCtx = GuardedReadPtr(
-                    reinterpret_cast<uint8_t*>(cmo) + m2::kOffCmoSceneNode);
+                    reinterpret_cast<uint8_t*>(cmo) + offsets::kOffCmoSceneNode);
                 if (charCtx && charCtx != entry.renderCtx)
                 {
                     if (entry.boneRemap.count == 0)
@@ -2473,9 +2473,9 @@ namespace wxl::scripts::equipextension
                     if (remap.count > 0)
                     {
                         auto* charBuf = reinterpret_cast<uint8_t*>(GuardedReadPtr(
-                            reinterpret_cast<uint8_t*>(charCtx) + m2::kOffInstBonePalette));
+                            reinterpret_cast<uint8_t*>(charCtx) + offsets::kOffInstBonePalette));
                         auto* collBuf = reinterpret_cast<uint8_t*>(GuardedReadPtr(
-                            reinterpret_cast<uint8_t*>(entry.renderCtx) + m2::kOffInstBonePalette));
+                            reinterpret_cast<uint8_t*>(entry.renderCtx) + offsets::kOffInstBonePalette));
                         EquipLog("  OnM2SkinFinalize(bone): charCtx=0x%p charBuf=0x%p collBuf=0x%p count=%u -> %s",
                              charCtx, static_cast<void*>(charBuf), static_cast<void*>(collBuf),
                              (uint32_t)remap.count,
@@ -2515,7 +2515,7 @@ namespace wxl::scripts::equipextension
         __try
         {
             const char* modelStem = reinterpret_cast<const char*>(
-                reinterpret_cast<uint8_t*>(model) + m2::kOffModelPathStem);
+                reinterpret_cast<uint8_t*>(model) + offsets::kOffModelPathStem);
             // Sanity-check: first char must be printable ASCII (path starts with 'I' for
             // Item\... paths). Garbage pointers or uninitialised memory fail this check.
             if (!modelStem || static_cast<unsigned char>(modelStem[0]) < 0x20
@@ -2580,12 +2580,15 @@ namespace wxl::scripts::equipextension
     // equip-slot events, but preserve the shared collection/character model pair, so handle those too.
     void EquipExtension::OnBuildBonePalette(const ev::BuildBonePaletteArgs& a)
    {
+    EquipLog("  OnBBP fired renderCtx=0x%p g_attached.size=%zu", a.renderCtx, g_attached.size()); // TEMP
+
         if (g_attached.empty()) return;
         void* renderCtx = a.renderCtx;
 
         // Fast reject: only collection models need manual bone driving.
         uint32_t initF = GuardedReadU32(
-            reinterpret_cast<uint8_t*>(renderCtx) + m2::kOffInstInitFlags);
+            reinterpret_cast<uint8_t*>(renderCtx) + offsets::kOffInstInitFlags);
+EquipLog("  OnBBP entry renderCtx=0x%p initF=0x%X", renderCtx, initF);   // TEMP
         if (!(initF & 0x40000)) return;
 										
 
@@ -2600,13 +2603,13 @@ namespace wxl::scripts::equipextension
 																							  
                 if (entry.boneRemap.count == 0) continue;
                 void* charRctx = GuardedReadPtr(
-                    reinterpret_cast<uint8_t*>(cmo) + m2::kOffCmoSceneNode);
+                    reinterpret_cast<uint8_t*>(cmo) + offsets::kOffCmoSceneNode);
                 if (!charRctx) continue;
                 auto* charBuf = reinterpret_cast<uint8_t*>(
-                    GuardedReadPtr(reinterpret_cast<uint8_t*>(charRctx) + m2::kOffInstBonePalette));
+                    GuardedReadPtr(reinterpret_cast<uint8_t*>(charRctx) + offsets::kOffInstBonePalette));
                 if (!charBuf) continue;
                 auto* collBuf = reinterpret_cast<uint8_t*>(
-                    GuardedReadPtr(reinterpret_cast<uint8_t*>(renderCtx) + m2::kOffInstBonePalette));
+                    GuardedReadPtr(reinterpret_cast<uint8_t*>(renderCtx) + offsets::kOffInstBonePalette));
                 if (!collBuf) continue;
                 const BoneRemap& remap = entry.boneRemap;
 
@@ -2678,8 +2681,8 @@ namespace wxl::scripts::equipextension
     {
         if (GetFileAttributesA("WarcraftXL_equip-extension.disable") != INVALID_FILE_ATTRIBUTES)
         {
-            WLOG_WARN("equip-extension: disabled by client flag");
-            return;
+//    api->Log(WXL_LOG_WARN, "equip-extension", "disabled by client flag");
+    return;
         }
         on<&EquipExtension::OnItemSlotChange>(ev::Event::OnItemSlotChange);
         on<&EquipExtension::OnItemSlotClear>(ev::Event::OnItemSlotClear);
@@ -2693,6 +2696,52 @@ namespace wxl::scripts::equipextension
         // directly in the data, the native loader never needs a live substitution hook to catch.
     }
 
-    // Self-registration: file-scope instance binds handlers at DLL load via EventScript ctor.
-    EquipExtension g_equipExtension;
+    // OLD: file-scope self-registering global (constructed at DLL load, before EventScript::Bind
+    // could ever have run). Construction now happens inside WXL_Load(), below, after Bind() --
+    // see PORTING_GUIDE.md Step 9.
 }
+
+// ========== Extension entry points (new in the 1.1 extension architecture) ==========
+//
+// wxl-equip-extension is one DLL covering three classes (EquipExtension, CreatureExtension,
+// WeaponExtension); per PORTING_GUIDE.md / QUICK_REFERENCE.md, all three bind and construct from
+// this single WXL_Load(), even though their implementations live in separate .cpp files.
+extern "C"
+{
+    const WXL_PluginInfo* __cdecl WXL_Query(void)
+    {
+        static const WXL_PluginInfo info = {
+            sizeof(WXL_PluginInfo),
+            WXL_API_VERSION,
+            "wxl-equip-extension",
+            1,                      // extension version (1.0)
+            WXL_CLIENT_BUILD,
+        };
+        return &info;
+    }
+
+    int __cdecl WXL_Load(const WXL_Api* api)
+    {
+        if (!api || api->apiVersion != WXL_API_VERSION)
+            return 0;
+
+        // Must happen before any EventScript-derived instance is constructed.
+        wxl::ext::EventScript::Bind(api);
+
+        // Replaces VirtualPath.cpp's old self-registering detail::Registrar global (which called
+        // straight into the core-internal wxl::runtime::storage::RegisterClientProvider). Installs
+        // this extension's own file-I/O hooks via api->HookAttach, since WXL_Api has no dedicated
+        // storage-provider registration.
+        wxl::scripts::equipextension::VPathRegisterStorageProvider(api);
+
+        // Construct all three extension classes here (equip + creature + weapon), all sharing
+        // this one DLL / one WXL_Load().
+        static wxl::scripts::equipextension::EquipExtension       g_equip;
+        static wxl::scripts::creatureextension::CreatureExtension g_creature;
+        static wxl::scripts::weaponextension::WeaponExtension     g_weapon;
+
+        api->Log(WXL_LOG_INFO, "equip-extension", "loaded (equip + creature + weapon)");
+        return 1;
+    }
+}
+// ======================================================================================

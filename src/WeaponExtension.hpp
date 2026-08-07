@@ -15,11 +15,15 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 #pragma once
-#include "events/EventScript.hpp"
+#define WXL_EXTENSION 1
+#include "wxl/PluginApi.h"
+#include "wxl/EventScript.hpp"
+
+#include "engine/events/Event.hpp"
 
 namespace wxl::scripts::weaponextension
 {
-    class WeaponExtension : public wxl::events::EventScript
+    class WeaponExtension : public wxl::ext::EventScript
     {
     public:
         WeaponExtension();

@@ -21,17 +21,17 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 #include "VirtualPath.hpp"
+#include "WxlOffsets.hpp"
 
-#include "runtime/storage/StorageHook.hpp"
-#include "game/io/Io.hpp"
-#include "offsets/engine/Io.hpp"
-#include "structure/m2/M2Format.hpp"
+#include "game/Io.hpp"
+#include "engine/assets/shared/models/m2/M2Format.hpp"
 
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -357,10 +357,9 @@ namespace wxl::scripts::equipextension
         static bool ReadGameFile(const char* path, std::vector<uint8_t>& out) noexcept
         {
             namespace io    = wxl::game::io;
-            namespace iooff = wxl::offsets::engine::io;
 
             void* handle = nullptr;
-            if (!io::FileOpen(path, iooff::kOpenWholeFile, &handle) || !handle)
+            if (!io::FileOpen(path, offsets::io::kOpenWholeFile, &handle) || !handle)
                 return false;
 
             uint32_t sizeHigh = 0;
@@ -800,14 +799,128 @@ namespace wxl::scripts::equipextension
             return true;
         }
 
-        struct Registrar
+        // OLD: self-registering global (constructed at DLL load, calling straight into the core's
+        // internal wxl::runtime::storage::RegisterClientProvider). Extensions cannot call core
+        // functions directly (see PORTING_GUIDE.md Step 9 / troubleshooting), and confirmed against
+        // the real wxl/PluginApi.h: WXL_Api has no storage/provider registration member at all --
+        // Log/Subscribe/Emit/HookAttach/PublishInterface/GetInterface/Ui*, nothing else. So this
+        // module now hooks the archive file-I/O primitives itself, the same four addresses the core's
+        // own StorageHook does (offsets::io::kFileOpen/kFileRead/kFileSize/kFileClose in
+        // WxlOffsets.hpp), via api->HookAttach -- "alongside any party already detouring it" is
+        // exactly this case: the core's own IPC-backed host provider chains behind this one.
+        // See detail::InstallFileHooks / VPathRegisterStorageProvider below.
+
+        // --- extension-owned virtual file layer -----------------------------------------------
+        // A "handle" the client sees for a virtual file is just the address of one of these,
+        // heap-allocated on open and freed on close. Never touches the real archive file handle
+        // space, so the chained-through original I/O primitives never see it.
+        struct VirtualHandle
         {
-            Registrar() { wxl::runtime::storage::RegisterClientProvider(&VirtualProvide); }
+            std::vector<uint8_t> bytes;
+            uint32_t             cursor = 0;
         };
-        static Registrar g_registrar;
+
+        // Live virtual handles, so FileSize/FileRead/FileClose can tell "one of ours" apart from a
+        // real archive handle without any tag bit the client's own handles might also set.
+        std::unordered_map<void*, std::unique_ptr<VirtualHandle>>& LiveHandles()
+        {
+            static std::unordered_map<void*, std::unique_ptr<VirtualHandle>> handles;
+            return handles;
+        }
+
+        offsets::io::Storage_FileOpenFn  g_origFileOpen  = nullptr;
+        offsets::io::Storage_FileReadFn  g_origFileRead  = nullptr;
+        offsets::io::Storage_FileSizeFn  g_origFileSize  = nullptr;
+        offsets::io::Storage_FileCloseFn g_origFileClose = nullptr;
+
+        int __stdcall FileOpenDetour(void* archive, const char* name, uint32_t flags, void** out)
+        {
+            std::vector<uint8_t> bytes;
+            if (name && VirtualProvide(name, bytes))
+            {
+                auto handle = std::make_unique<VirtualHandle>();
+                handle->bytes = std::move(bytes);
+                void* key = handle.get();
+                LiveHandles().emplace(key, std::move(handle));
+                if (out) *out = key;
+                VPathLog("  FileOpenDetour: served virtual '%s' (%p)", name, key);
+                return 1;
+            }
+            return g_origFileOpen(archive, name, flags, out);
+        }
+
+        uint32_t __stdcall FileSizeDetour(void* handle, uint32_t* sizeHigh)
+        {
+            auto it = LiveHandles().find(handle);
+            if (it != LiveHandles().end())
+            {
+                if (sizeHigh) *sizeHigh = 0;
+                return static_cast<uint32_t>(it->second->bytes.size());
+            }
+            return g_origFileSize(handle, sizeHigh);
+        }
+
+        int __stdcall FileReadDetour(void* handle, void* dst, uint32_t len, uint32_t* read, void* ovl, uint32_t unk)
+        {
+            auto it = LiveHandles().find(handle);
+            if (it != LiveHandles().end())
+            {
+                VirtualHandle& vh = *it->second;
+                uint32_t remaining = vh.cursor < vh.bytes.size()
+                                   ? static_cast<uint32_t>(vh.bytes.size()) - vh.cursor : 0;
+                uint32_t toCopy = len < remaining ? len : remaining;
+                if (toCopy && dst) std::memcpy(dst, vh.bytes.data() + vh.cursor, toCopy);
+                vh.cursor += toCopy;
+                if (read) *read = toCopy;
+                return 1;
+            }
+            return g_origFileRead(handle, dst, len, read, ovl, unk);
+        }
+
+        int __stdcall FileCloseDetour(void* handle)
+        {
+            auto it = LiveHandles().find(handle);
+            if (it != LiveHandles().end())
+            {
+                LiveHandles().erase(it);
+                return 1;
+            }
+            return g_origFileClose(handle);
+        }
+
+        bool InstallFileHooks(const WXL_Api* api)
+        {
+            if (!api) return false;
+            bool ok = true;
+            ok &= api->HookAttach("wxl-equip-extension:FileOpen",  offsets::io::kFileOpen,
+                                  reinterpret_cast<void*>(&FileOpenDetour),
+                                  reinterpret_cast<void**>(&g_origFileOpen),  WXL_HOOK_DEFAULT_PRIORITY) != 0;
+            ok &= api->HookAttach("wxl-equip-extension:FileSize",  offsets::io::kFileSize,
+                                  reinterpret_cast<void*>(&FileSizeDetour),
+                                  reinterpret_cast<void**>(&g_origFileSize),  WXL_HOOK_DEFAULT_PRIORITY) != 0;
+            ok &= api->HookAttach("wxl-equip-extension:FileRead",  offsets::io::kFileRead,
+                                  reinterpret_cast<void*>(&FileReadDetour),
+                                  reinterpret_cast<void**>(&g_origFileRead),  WXL_HOOK_DEFAULT_PRIORITY) != 0;
+            ok &= api->HookAttach("wxl-equip-extension:FileClose", offsets::io::kFileClose,
+                                  reinterpret_cast<void*>(&FileCloseDetour),
+                                  reinterpret_cast<void**>(&g_origFileClose), WXL_HOOK_DEFAULT_PRIORITY) != 0;
+            if (!ok)
+                api->Log(WXL_LOG_ERROR, "equip-extension", "VirtualPath: one or more file-I/O hooks failed");
+            return ok;
+        }
     }
 
     // ─── Public API ───────────────────────────────────────────────────────────
+
+    // Replaces the old self-registering `detail::Registrar` global above. Must be called from
+    // WXL_Load(), AFTER wxl::ext::EventScript::Bind(api), same ordering requirement as constructing
+    // the EquipExtension/CreatureExtension/WeaponExtension instances -- HookAttach itself is safe
+    // any time after WXL_Load starts, but keeping every setup call in one place after Bind avoids a
+    // second "did I call this early enough" question to answer later.
+    void VPathRegisterStorageProvider(const WXL_Api* api)
+    {
+        InstallFileHooks(api);
+    }
 
     size_t VPathBuildKey(char* out, size_t outSz, void* cmo,
                          const char* realMdxPath,

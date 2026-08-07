@@ -15,12 +15,10 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 #include "CreatureExtension.hpp"
+#include "WxlOffsets.hpp"
 #include "VirtualPath.hpp"
-#include "events/Event.hpp"
-#include "game/io/Io.hpp"
-#include "offsets/engine/Io.hpp"
-#include "offsets/game/DB2.hpp"
-#include "offsets/game/M2.hpp"
+#include "engine/events/Event.hpp"
+#include "game/Io.hpp"
 
 #include <windows.h>
 
@@ -45,6 +43,7 @@ using wxl::scripts::equipextension::WxlIniGetBool;
 namespace wxl::scripts::creatureextension
 {
     namespace ev  = wxl::events;
+	namespace offsets = wxl::scripts::equipextension::offsets;
 
     // ─── Logging ────────────────────────────────────────────────────────────────
     // Same opt-in-file-log shape as EquipExtension's EquipLog/EquipLogEnabled, kept separate (own
@@ -193,10 +192,9 @@ namespace wxl::scripts::creatureextension
         }
 
         namespace io    = wxl::game::io;
-        namespace iooff = wxl::offsets::engine::io;
 
         void* handle = nullptr;
-        if (!io::FileOpen(path, iooff::kOpenWholeFile, &handle) || !handle)
+        if (!io::FileOpen(path, offsets::io::kOpenWholeFile, &handle) || !handle)
             return false;
 
         uint32_t sizeHigh = 0;
@@ -614,5 +612,7 @@ namespace wxl::scripts::creatureextension
     }
 
     // Self-registration: file-scope instance binds handlers at DLL load via EventScript ctor.
-    CreatureExtension g_creatureExtension;
+    // OLD: file-scope self-registering global. Removed -- CreatureExtension is now constructed
+    // from EquipExtension.cpp's shared WXL_Load(), after wxl::ext::EventScript::Bind(api). This
+    // file defines no entry points of its own (only one WXL_Query/WXL_Load pair per DLL).
 }
