@@ -56,6 +56,23 @@ namespace wxl::scripts::equipextension::offsets
     constexpr size_t kOffBoneParent  = 0x08; // int16 parent index (0xFFFF = root)
     constexpr size_t kOffBoneNameCrc = 0x0C; // CRC32 of the bone name string (name-based remap)
 
+    // ---- from offsets/game/M2.hpp: per-frame / bone-palette hook points ----
+    // The core's own hook for these two events was dropped when GameHooks.cpp was retired during
+    // the 1.1 port (see PORTING_GUIDE.md) and never carved into a replacement file, unlike
+    // CharModelSlotDispatch/Clear which moved to CharModel.cpp. EquipExtension.cpp installs its
+    // own raw HookAttach on these addresses instead of relying on ev::Emit(OnM2PerFrameUpdate /
+    // OnBuildBonePalette, ...) ever firing.
+    namespace m2hooks
+    {
+        constexpr uintptr_t kM2PerFrameUpdate = 0x00828A00;
+        constexpr uintptr_t kBuildBonePalette = 0x0082F0F0;
+
+        using PerFrameUpdateFn   = void(__fastcall*)(void* renderCtx, void* edx);
+        using BuildBonePaletteFn = void(__fastcall*)(void* renderCtx, void* edx,
+                                                       void* sa1, void* sa2, void* sa3,
+                                                       uint32_t sa4, uint32_t sa5);
+    }
+
     // ---- from offsets/game/DB2.hpp: ItemDisplayInfo ----
     namespace itemdisplayinfo
     {

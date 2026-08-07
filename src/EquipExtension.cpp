@@ -122,6 +122,8 @@ namespace wxl::scripts::equipextension
     // PatchWeaponModelByDisplayId, OnWeaponVisualChange, OnItemDisplayLookup), all removed now that
     // WeaponExtension patches ItemModelData.dbc at the data level instead. See WeaponExtension.cpp.
 
+static EquipExtension* g_equipInstance = nullptr; // set in the constructor, used by the raw hooks below
+
     // cmo (CharModelObject*) → attached M2 entries for that character
     static std::unordered_map<void*, std::vector<AttachEntry>> g_attached;
 
@@ -2694,11 +2696,64 @@ EquipLog("  OnBBP entry renderCtx=0x%p initF=0x%X", renderCtx, initF);   // TEMP
         // resolution moved to WeaponExtension, which patches ItemModelData.dbc at the data level
         // instead. Nothing subscribes to either event any more: with the virtual path named
         // directly in the data, the native loader never needs a live substitution hook to catch.
+        g_equipInstance = this;
     }
 
     // OLD: file-scope self-registering global (constructed at DLL load, before EventScript::Bind
     // could ever have run). Construction now happens inside WXL_Load(), below, after Bind() --
     // see PORTING_GUIDE.md Step 9.
+
+    namespace
+    {
+    offsets::m2hooks::PerFrameUpdateFn   g_origM2PerFrame       = nullptr;
+    offsets::m2hooks::BuildBonePaletteFn g_origBuildBonePalette = nullptr;
+    }
+
+    // Defined directly in wxl::scripts::equipextension (NOT in the anonymous namespace above) so
+    // these are the same entities the friend declarations in EquipExtension.hpp refer to -- a
+    // definition inside an anonymous namespace would be a distinct entity from the one the friend
+    // grant was bound to, and access to the private On*/OnBuildBonePalette members would fail.
+    void __fastcall M2PerFrameUpdateDetour(void* renderCtx, void* edx)
+    {
+        g_origM2PerFrame(renderCtx, edx);
+        if (g_equipInstance)
+        {
+            ev::M2PerFrameUpdateArgs a{ renderCtx };
+            g_equipInstance->OnM2PerFrameUpdate(a);
+        }
+    }
+
+    void __fastcall BuildBonePaletteDetour(void* renderCtx, void* edx,
+        void* sa1, void* sa2, void* sa3, uint32_t sa4, uint32_t sa5)
+    {
+        g_origBuildBonePalette(renderCtx, edx, sa1, sa2, sa3, sa4, sa5);
+        if (g_equipInstance)
+        {
+            ev::BuildBonePaletteArgs a{ renderCtx };
+            g_equipInstance->OnBuildBonePalette(a);
+        }
+    }
+
+    namespace
+    {
+    bool InstallM2RenderHooks(const WXL_Api* api)
+    {
+        bool ok = true;
+        ok &= api->HookAttach("wxl-equip-extension:M2PerFrameUpdate",
+                              offsets::m2hooks::kM2PerFrameUpdate,
+                              reinterpret_cast<void*>(&M2PerFrameUpdateDetour),
+                              reinterpret_cast<void**>(&g_origM2PerFrame),
+                              WXL_HOOK_DEFAULT_PRIORITY) != 0;
+        ok &= api->HookAttach("wxl-equip-extension:BuildBonePalette",
+                              offsets::m2hooks::kBuildBonePalette,
+                              reinterpret_cast<void*>(&BuildBonePaletteDetour),
+                              reinterpret_cast<void**>(&g_origBuildBonePalette),
+                              WXL_HOOK_DEFAULT_PRIORITY) != 0;
+        if (!ok)
+            api->Log(WXL_LOG_ERROR, "equip-extension", "M2Render: one or more hooks failed");
+        return ok;
+    }
+    }
 }
 
 // ========== Extension entry points (new in the 1.1 extension architecture) ==========
@@ -2733,7 +2788,7 @@ extern "C"
         // this extension's own file-I/O hooks via api->HookAttach, since WXL_Api has no dedicated
         // storage-provider registration.
         wxl::scripts::equipextension::VPathRegisterStorageProvider(api);
-
+wxl::scripts::equipextension::InstallM2RenderHooks(api);
         // Construct all three extension classes here (equip + creature + weapon), all sharing
         // this one DLL / one WXL_Load().
         static wxl::scripts::equipextension::EquipExtension       g_equip;
