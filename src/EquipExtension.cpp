@@ -64,8 +64,8 @@ namespace wxl::scripts::equipextension
     {
         uint16_t count;
         uint8_t  collToChar[256];
-
-
+        void*    collectionModel; // live M2 model this remap was built for (collection side)
+        void*    characterModel;  // live M2 model this remap was built for (character/pose side)
     };
 
     struct SidecarModelEntry
@@ -108,6 +108,7 @@ namespace wxl::scripts::equipextension
         bool        perFrameLogged    = false; // suppress repeated per-frame noise after first log
         bool        charSweepApplied = false; // set when character-model PerFrame sweep first copies bones
         bool        bbpLogDone       = false; // suppress OnBuildBonePalette remap dump after first fire
+        bool        cloneBbpLogDone  = false; // suppress duplicate-ModelFrame fallback noise
         uint16_t    texAnimProbeFrames = 0; // short targeted UV-animation diagnostic
         uint32_t    texAnimProbeFirst[4] = {};
         uint8_t     texAnimProbeChanged = 0;											
@@ -265,6 +266,77 @@ static EquipExtension* g_equipInstance = nullptr; // set in the constructor, use
         return v;
     }
 
+    static void* NativeParentGuarded(void* instance) noexcept
+    {
+        if (!instance) return nullptr;
+        void* parent = GuardedReadPtr(
+            reinterpret_cast<uint8_t*>(instance) + offsets::kOffInstParent);
+        return parent != instance ? parent : nullptr;
+    }
+
+    // Locate the character instance inside a duplicated/parented M2 tree by shared-model identity.
+    // We deliberately do not choose the absolute root: a character can itself be attached to a
+    // mount or vehicle, while the collection mesh still needs the character's bone palette.
+    static void* FindAncestorWithModelGuarded(void* instance, void* wantedModel) noexcept
+    {
+        if (!instance || !wantedModel) return nullptr;
+
+        void* seen[32] = {};
+        void* current = NativeParentGuarded(instance);
+        for (uint32_t depth = 0; depth < 32; ++depth)
+        {
+            if (!current) return nullptr;
+            for (uint32_t i = 0; i < depth; ++i)
+                if (seen[i] == current) return nullptr;
+            seen[depth] = current;
+
+            if (GuardedReadPtr(reinterpret_cast<uint8_t*>(current) + offsets::kOffInstModel) ==
+                wantedModel)
+                return current;
+            current = NativeParentGuarded(current);
+        }
+        return nullptr;
+    }
+
+    static bool BoneRemapHasMatch(const BoneRemap& remap) noexcept
+    {
+        if (remap.count == 0 || remap.count > 65535) return false;
+        for (uint32_t i = 0; i < remap.count; ++i)
+            if (remap.collToChar[i] != 0xFF) return true;
+        return false;
+    }
+
+    static bool BoneRemapMatchesContextsGuarded(const BoneRemap& remap,
+                                                void* collectionCtx,
+                                                void* characterCtx) noexcept
+    {
+        if (!BoneRemapHasMatch(remap) || !collectionCtx || !characterCtx ||
+            collectionCtx == characterCtx || !remap.collectionModel || !remap.characterModel)
+            return false;
+
+        return GuardedReadPtr(reinterpret_cast<uint8_t*>(collectionCtx) + offsets::kOffInstModel) ==
+                   remap.collectionModel &&
+               GuardedReadPtr(reinterpret_cast<uint8_t*>(characterCtx) + offsets::kOffInstModel) ==
+                   remap.characterModel;
+    }
+
+    static uint32_t RenderCtxBoneCountGuarded(void* renderCtx) noexcept
+    {
+        if (!renderCtx) return 0;
+        __try
+        {
+            void* model = *reinterpret_cast<void**>(
+                reinterpret_cast<uint8_t*>(renderCtx) + offsets::kOffInstModel);
+            if (!model) return 0;
+            auto* header = *reinterpret_cast<uint8_t**>(
+                reinterpret_cast<uint8_t*>(model) + offsets::kOffModelHeader);
+            if (!header) return 0;
+            const uint32_t count = *reinterpret_cast<uint32_t*>(header + offsets::kOffHdrBoneCount);
+            return count <= 65535 ? count : 0;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+    }
+
     static uint32_t GuardedMatrixHash(const void* matrix) noexcept
     {
         if (!matrix) return 0;
@@ -329,34 +401,36 @@ static EquipExtension* g_equipInstance = nullptr; // set in the constructor, use
     }
 
     static bool CopyRemappedBonesGuarded(uint8_t* dstBuf,
+                                         uint32_t dstBoneCount,
                                          const uint8_t* srcBuf,
-                                         const BoneRemap& remap) noexcept
-																	 
+                                         uint32_t srcBoneCount,
+                                         const BoneRemap& remap,
+                                         void* dstRenderCtx,
+                                         void* srcRenderCtx) noexcept
     {
-							   
-		 
-									   
-						
-			 
-							  
-																										
-			 
-						
-		 
-																					   
-        if (!dstBuf || !srcBuf || remap.count == 0 || remap.count > 256)
-																
-															  
-																													
-																												 
+        // The palette is allocated as modelBoneCount * 0x40 by the engine. A stale render-context
+        // address can be recycled for a smaller model while g_attached still holds the old remap;
+        // an unguarded copy loop would then write beyond that new palette and corrupt the heap.
+        // Require the live destination model to have the exact count the remap was built for and
+        // independently bind every source index to the live character model.
+        if (!dstBuf || !srcBuf || dstBuf == srcBuf || !dstRenderCtx || !srcRenderCtx ||
+            remap.count == 0 || remap.count > 65535 ||
+            dstBoneCount == 0 || srcBoneCount == 0 ||
+            remap.count != dstBoneCount || srcBoneCount > 65535 ||
+            !remap.collectionModel || !remap.characterModel ||
+            GuardedReadPtr(reinterpret_cast<uint8_t*>(dstRenderCtx) + offsets::kOffInstModel) !=
+                remap.collectionModel ||
+            GuardedReadPtr(reinterpret_cast<uint8_t*>(srcRenderCtx) + offsets::kOffInstModel) !=
+                remap.characterModel)
             return false;
+
         __try
         {
             for (uint32_t bi = 0; bi < remap.count; ++bi)
             {
                 uint8_t ci = remap.collToChar[bi];
                 if (ci == 0xFF) continue;
-
+                if (ci >= srcBoneCount) continue;
                 std::memcpy(dstBuf + bi * offsets::kBonePaletteStride,
                             srcBuf + ci * offsets::kBonePaletteStride,
                             offsets::kBonePaletteStride);
@@ -396,7 +470,8 @@ static EquipExtension* g_equipInstance = nullptr; // set in the constructor, use
             void* collM2  = *reinterpret_cast<void**>(collBytes + offsets::kOffInstModel);
             void* charM2  = *reinterpret_cast<void**>(charBytes + offsets::kOffInstModel);
             if (!collM2 || !charM2) return r;
-
+            r.collectionModel = collM2;
+            r.characterModel  = charM2;
 
             // M2AnimData = raw M2 file buffer = M2FileHeader (at m2_inst+0x150)
             auto* collHdr = *reinterpret_cast<uint8_t**>(reinterpret_cast<uint8_t*>(collM2) + offsets::kOffModelHeader);
@@ -412,10 +487,10 @@ static EquipExtension* g_equipInstance = nullptr; // set in the constructor, use
             uint32_t charLutN = *reinterpret_cast<uint32_t*>(charHdr + offsets::kOffHdrBoneIdxLutCount);
             int16_t* charLut  = *reinterpret_cast<int16_t**>(charHdr + offsets::kOffHdrBoneIdxLutPtr);
 
-          //  EquipLog("  BuildBoneRemap: collN=%u charN=%u collBase=%p charBase=%p charLut=%p",
-          //           collN, charN, collBase, charBase, charLut);
-          //  if (!collBase || collN == 0 || collN > 256 || charN == 0 || charN > 256) return r;
-            r.count = static_cast<uint16_t>(collN);
+            EquipLog("  BuildBoneRemap: collN=%u charN=%u collBase=%p charBase=%p charLut=%p",
+                     collN, charN, collBase, charBase, charLut);
+//if (!collBase || collN == 0 || collN > 256 || charN == 0) return r;
+r.count = static_cast<uint16_t>(collN);
 
             // Pass 1a: bone name CRC match for remaining unmatched bones
             if (charBase)
@@ -966,6 +1041,23 @@ static EquipExtension* g_equipInstance = nullptr; // set in the constructor, use
     static bool IsCollectionEntry(const AttachEntry& e) noexcept
     {
         return e.geoFilter.count > 0 || IsCollectionObjectPath(e.keyBuf);
+    }
+
+    static bool IsRootSkinnedEntry(const AttachEntry& e) noexcept
+    {
+        // Retail ModelType=1 cape M2s are full character-space skinned models. The DB2
+        // builder marks them with the synthetic root attachment even though their path is
+        // under ObjectComponents\Cape rather than ObjectComponents\Collections.
+        return e.attachId == kCollectionAttach &&
+               (IsCollectionEntry(e) || e.equipSlot == 10);
+    }
+
+    static bool NeedsManualBoneRemap(const AttachEntry& e) noexcept
+    {
+        // Full-body collection overlays are attached to the character root and need their
+        // palette driven from the character skeleton. Dedicated helm/shoulder/belt models use
+        // native attachment points and must retain their own accessory-bone animation chains.
+        return IsRootSkinnedEntry(e);
     }
 
     static bool ShouldDetachDefaultAttachPoints(const AttachEntry& e) noexcept
@@ -2205,7 +2297,7 @@ static EquipExtension* g_equipInstance = nullptr; // set in the constructor, use
             {
                 for (auto& entry : entries)
                 {
-                    if (!IsCollectionEntry(entry)) continue;
+                    if (!NeedsManualBoneRemap(entry)) continue;
                     if (!entry.renderCtx || entry.boneRemap.count == 0) continue;
                     auto* collBuf = reinterpret_cast<uint8_t*>(
                         GuardedReadPtr(reinterpret_cast<uint8_t*>(entry.renderCtx) + offsets::kOffInstBonePalette));
@@ -2221,20 +2313,15 @@ static EquipExtension* g_equipInstance = nullptr; // set in the constructor, use
                         entry.charSweepApplied = true;
                     }
                     const BoneRemap& remap = entry.boneRemap;
-																							  
-																						
-                    if (!CopyRemappedBonesGuarded(collBuf, charBuf, remap))
-																					 
+                    const uint32_t collBoneCount = RenderCtxBoneCountGuarded(entry.renderCtx);
+                    const uint32_t charBoneCount = RenderCtxBoneCountGuarded(renderCtx);
+                    if (!CopyRemappedBonesGuarded(collBuf, collBoneCount, charBuf, charBoneCount,
+                                                  remap, entry.renderCtx, renderCtx))
                     {
                         EquipLog("  CharSweep(bone): guarded copy failed rctx=0x%p count=%u",
                                  entry.renderCtx, (uint32_t)remap.count);
-														  
-													 
-						 
-																		 
+                        entry.boneRemap = {};
                         entry.renderCtx = nullptr;
-												   
-
                     }
                 }
             }
@@ -2392,19 +2479,15 @@ static EquipExtension* g_equipInstance = nullptr; // set in the constructor, use
 
                     if (charBuf && collBuf)
                     {
-																							
-																						  
-                        if (!CopyRemappedBonesGuarded(collBuf, charBuf, remap))
-																				 
+                        const uint32_t collBoneCount = RenderCtxBoneCountGuarded(renderCtx);
+                        const uint32_t charBoneCount = RenderCtxBoneCountGuarded(charCtx);
+                        if (!CopyRemappedBonesGuarded(collBuf, collBoneCount, charBuf, charBoneCount,
+                                                      remap, renderCtx, charCtx))
                         {
                             EquipLog("  PerFrame(copy): guarded copy failed rctx=0x%p count=%u",
                                      renderCtx, (uint32_t)remap.count);
-														 
-							 
-																			 
+                            entry.boneRemap = {};
                             entry.renderCtx = nullptr;
-													   
-
                         }
                     }
                 }
@@ -2426,7 +2509,7 @@ static EquipExtension* g_equipInstance = nullptr; // set in the constructor, use
         {
             for (auto& entry : entries)
             {
-                if (!entry.renderCtx || !IsCollectionEntry(entry)) continue;
+                if (!entry.renderCtx || !NeedsManualBoneRemap(entry)) continue;
                 void* entryModel = GuardedReadPtr(
                     reinterpret_cast<uint8_t*>(entry.renderCtx) + offsets::kOffInstModel);
                 if (entryModel != model) continue;
@@ -2484,20 +2567,15 @@ static EquipExtension* g_equipInstance = nullptr; // set in the constructor, use
                              (charBuf && collBuf) ? "APPLIED" : "DEFERRED-to-PerFrame");
                     if (charBuf && collBuf)
                         {
-																									  
-																							  
-                            if (!CopyRemappedBonesGuarded(collBuf, charBuf, remap))
-																						   
+                            const uint32_t collBoneCount = RenderCtxBoneCountGuarded(entry.renderCtx);
+                            const uint32_t charBoneCount = RenderCtxBoneCountGuarded(charCtx);
+                            if (!CopyRemappedBonesGuarded(collBuf, collBoneCount, charBuf, charBoneCount,
+                                                          remap, entry.renderCtx, charCtx))
                             {
                                 EquipLog("  OnM2SkinFinalize(copy): guarded copy failed rctx=0x%p count=%u",
                                          entry.renderCtx, (uint32_t)remap.count);
-																  
-															 
-								 
-																				 
+                                entry.boneRemap = {};
                                 entry.renderCtx = nullptr;
-														   
-								 
                             }
                         }
                     }
@@ -2581,54 +2659,79 @@ static EquipExtension* g_equipInstance = nullptr; // set in the constructor, use
     // Re-apply the character remap after the engine's native palette build. ModelFrame clones do not fire
     // equip-slot events, but preserve the shared collection/character model pair, so handle those too.
     void EquipExtension::OnBuildBonePalette(const ev::BuildBonePaletteArgs& a)
-   {
-    EquipLog("  OnBBP fired renderCtx=0x%p g_attached.size=%zu", a.renderCtx, g_attached.size()); // TEMP
-
-        if (g_attached.empty()) return;
+    {
+        if (g_attached.empty() || !a.renderCtx) return;
         void* renderCtx = a.renderCtx;
+        void* childModel = GuardedReadPtr(
+            reinterpret_cast<uint8_t*>(renderCtx) + offsets::kOffInstModel);
+        AttachEntry* cloneCandidate = nullptr;
+        void* clonePoseSource = nullptr;
 
-        // Fast reject: only collection models need manual bone driving.
-        uint32_t initF = GuardedReadU32(
-            reinterpret_cast<uint8_t*>(renderCtx) + offsets::kOffInstInitFlags);
-EquipLog("  OnBBP entry renderCtx=0x%p initF=0x%X", renderCtx, initF);   // TEMP
-        if (!(initF & 0x40000)) return;
-										
-
+        // Handle exact tracked instances immediately while remembering at most one validated
+        // ModelFrame clone candidate. This keeps the hot callback to one g_attached traversal.
         for (auto& [cmo, entries] : g_attached)
         {
-																									
+            void* charRctx = GuardedReadPtr(
+                reinterpret_cast<uint8_t*>(cmo) + offsets::kOffCmoSceneNode);
+
             for (auto& entry : entries)
             {
-                if (entry.renderCtx != renderCtx) continue;
-                if (entry.geoFilter.count == 0) continue;
-				 
-																							  
-                if (entry.boneRemap.count == 0) continue;
-                void* charRctx = GuardedReadPtr(
-                    reinterpret_cast<uint8_t*>(cmo) + offsets::kOffCmoSceneNode);
-                if (!charRctx) continue;
-                auto* charBuf = reinterpret_cast<uint8_t*>(
-                    GuardedReadPtr(reinterpret_cast<uint8_t*>(charRctx) + offsets::kOffInstBonePalette));
-                if (!charBuf) continue;
+                if (!NeedsManualBoneRemap(entry)) continue;
+
+                if (entry.renderCtx != renderCtx)
+                {
+                    if (!cloneCandidate && childModel &&
+                        BoneRemapHasMatch(entry.boneRemap) &&
+                        entry.boneRemap.collectionModel == childModel &&
+                        entry.boneRemap.characterModel)
+                    {
+                        void* candidateSource = FindAncestorWithModelGuarded(
+                            renderCtx, entry.boneRemap.characterModel);
+                        if (candidateSource)
+                        {
+                            cloneCandidate = &entry;
+                            clonePoseSource = candidateSource;
+                        }
+                    }
+                    continue;
+                }
+
+                // The native parent is authoritative after attachment. Resolve by model identity
+                // so a mounted character is selected instead of an outer vehicle/root instance.
+                void* poseSource = FindAncestorWithModelGuarded(
+                    renderCtx, entry.boneRemap.characterModel);
+                if (!poseSource) poseSource = NativeParentGuarded(renderCtx);
+                if (!poseSource) poseSource = charRctx;
+                if (!poseSource || poseSource == renderCtx) return;
+
+                if (!BoneRemapMatchesContextsGuarded(
+                        entry.boneRemap, renderCtx, poseSource))
+                {
+                    BoneRemap rebuilt = BuildBoneRemapGuarded(renderCtx, poseSource);
+                    if (!BoneRemapHasMatch(rebuilt)) return;
+                    for (auto& sibling : entries)
+                        if (sibling.renderCtx == renderCtx) sibling.boneRemap = rebuilt;
+                }
+
+                const BoneRemap& remap = entry.boneRemap;
+                auto* charBuf = reinterpret_cast<uint8_t*>(GuardedReadPtr(
+                    reinterpret_cast<uint8_t*>(poseSource) + offsets::kOffInstBonePalette));
                 auto* collBuf = reinterpret_cast<uint8_t*>(
                     GuardedReadPtr(reinterpret_cast<uint8_t*>(renderCtx) + offsets::kOffInstBonePalette));
-                if (!collBuf) continue;
-                const BoneRemap& remap = entry.boneRemap;
-
-																										   
-																			 
-													   
-																   
+                if (!charBuf || !collBuf) return;
 
                 if (!entry.bbpLogDone)
                 {
+                    uint32_t initF = GuardedReadU32(
+                        reinterpret_cast<uint8_t*>(renderCtx) + offsets::kOffInstInitFlags);
                     uint32_t xff = 0;
                     for (uint32_t bi = 0; bi < remap.count; ++bi)
                         if (remap.collToChar[bi] == 0xFF) ++xff;
-                    float m00 = *reinterpret_cast<const float*>(charBuf); // [0,0] of char bone 0
-                    EquipLog("  OnBBP[first] collRctx=0x%p initF=0x%X count=%u xff=%u"
-                             " map0-7=[%u %u %u %u %u %u %u %u] charBuf[0][0]=%.4f",
-                             renderCtx, initF, (uint32_t)remap.count, xff,
+                    EquipLog("  OnBBP[first] collRctx=0x%p cmoParent=0x%p nativeSource=0x%p"
+                             " initF=0x%X count=%u xff=%u"
+                             " map0-7=[%u %u %u %u %u %u %u %u]",
+                             renderCtx, charRctx, poseSource,
+                             initF, (uint32_t)remap.count, xff,
                              remap.count>0 ? (uint32_t)remap.collToChar[0] : 255u,
                              remap.count>1 ? (uint32_t)remap.collToChar[1] : 255u,
                              remap.count>2 ? (uint32_t)remap.collToChar[2] : 255u,
@@ -2636,46 +2739,59 @@ EquipLog("  OnBBP entry renderCtx=0x%p initF=0x%X", renderCtx, initF);   // TEMP
                              remap.count>4 ? (uint32_t)remap.collToChar[4] : 255u,
                              remap.count>5 ? (uint32_t)remap.collToChar[5] : 255u,
                              remap.count>6 ? (uint32_t)remap.collToChar[6] : 255u,
-                             remap.count>7 ? (uint32_t)remap.collToChar[7] : 255u,
-                             m00);
+                             remap.count>7 ? (uint32_t)remap.collToChar[7] : 255u);
                     entry.bbpLogDone = true;
                 }
 
-														 
-																		  
-																					   
-																		  
-																					  
-												 
-                if (!CopyRemappedBonesGuarded(collBuf, charBuf, remap))
-																							 
-																			
+                const uint32_t collBoneCount = RenderCtxBoneCountGuarded(renderCtx);
+                const uint32_t charBoneCount = RenderCtxBoneCountGuarded(poseSource);
+                if (!CopyRemappedBonesGuarded(collBuf, collBoneCount,
+                                              charBuf, charBoneCount, remap,
+                                              renderCtx, poseSource))
                 {
                     EquipLog("  OnBBP(copy): guarded copy failed rctx=0x%p count=%u",
                              renderCtx, (uint32_t)remap.count);
-												 
-					 
-																	 
-											   
-                    entry.renderCtx = nullptr;
-					 
+                    const bool staleDestination =
+                        GuardedReadPtr(reinterpret_cast<uint8_t*>(renderCtx) +
+                                       offsets::kOffInstModel) != remap.collectionModel;
+                    for (auto& sibling : entries)
+                    {
+                        if (sibling.renderCtx != renderCtx) continue;
+                        sibling.boneRemap = {};
+                        if (staleDestination) sibling.renderCtx = nullptr;
+                    }
                 }
                 return; // renderCtx is unique per (keyBuf,attachId,texBuf) group; one copy suffices
-					   
             }
         }
 
-														
-														   
-																  
-																					
-																  
-																			  
-										 
-																				   
-																						
-																	   
-												   
+        // CharacterModelFrame/PlayerModel duplicates the complete character M2 tree. Those clone
+        // children never pass through CharModelSlotDispatch and therefore have new renderCtx
+        // pointers absent from g_attached. DuplicateModel does preserve both shared model pointers,
+        // so the (collection model, character ancestor model) pair safely identifies the clone.
+        if (!cloneCandidate || !clonePoseSource) return;
+        const BoneRemap& remap = cloneCandidate->boneRemap;
+        auto* charBuf = reinterpret_cast<uint8_t*>(GuardedReadPtr(
+            reinterpret_cast<uint8_t*>(clonePoseSource) + offsets::kOffInstBonePalette));
+        auto* collBuf = reinterpret_cast<uint8_t*>(GuardedReadPtr(
+            reinterpret_cast<uint8_t*>(renderCtx) + offsets::kOffInstBonePalette));
+        if (!charBuf || !collBuf) return;
+
+        const uint32_t collBoneCount = RenderCtxBoneCountGuarded(renderCtx);
+        const uint32_t charBoneCount = RenderCtxBoneCountGuarded(clonePoseSource);
+        if (!CopyRemappedBonesGuarded(collBuf, collBoneCount,
+                                      charBuf, charBoneCount, remap,
+                                      renderCtx, clonePoseSource))
+            return;
+
+        if (!cloneCandidate->cloneBbpLogDone)
+        {
+            EquipLog("  OnBBP[clone] collRctx=0x%p source=0x%p collModel=0x%p"
+                     " charModel=0x%p count=%u",
+                     renderCtx, clonePoseSource, remap.collectionModel,
+                     remap.characterModel, (uint32_t)remap.count);
+            cloneCandidate->cloneBbpLogDone = true;
+        }
     }
     // ─── Constructor ──────────────────────────────────────────────────────────────
 

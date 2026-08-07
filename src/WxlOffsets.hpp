@@ -38,6 +38,9 @@ namespace wxl::scripts::equipextension::offsets
     constexpr size_t kOffInstInitFlags  = 0x10; // bit 0 = anim init done; bit 6 = char-select present
     constexpr size_t kOffInstModel      = 0x2C; // -> runtime model
     constexpr size_t kOffInstBonePalette= 0x98; // -> bone matrices, row-major 4x4
+    constexpr size_t kOffInstParent     = 0x48; // -> parent M2 instance (null for root); verified
+                                                 // against the core's M2.hpp static_assert on
+                                                 // offsetof(M2Instance, parent)
     constexpr size_t kBonePaletteStride = 0x40; // one bone matrix
 
     // ---- from offsets/game/M2.hpp: runtime model object fields ----
