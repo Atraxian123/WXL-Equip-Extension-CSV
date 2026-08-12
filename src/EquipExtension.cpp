@@ -856,15 +856,53 @@ namespace wxl::scripts::equipextension
             const char* b = needle;
             while (*a && *b)
             {
-                char ca = *a++;
-                char cb = *b++;
+                char ca = *a;
+                char cb = *b;
                 if (ca >= 'A' && ca <= 'Z') ca = static_cast<char>(ca - 'A' + 'a');
                 if (cb >= 'A' && cb <= 'Z') cb = static_cast<char>(cb - 'A' + 'a');
                 if (ca != cb) break;
+                ++a; ++b;
             }
             if (!*b) return true;
         }
         return false;
+    }
+
+    // Case-insensitive suffix match. optExt, if non-null, is an additional extension (e.g. ".mdx")
+    // that -- when present at the very end of s -- is ignored before the suffix comparison, so
+    // "..._shoulder_l.mdx" still matches suffix "_l".
+    static bool EndsWithCI(const char* s, const char* suffix, const char* optExt = nullptr) noexcept
+    {
+        if (!s || !suffix || !*suffix) return false;
+        size_t sLen = std::strlen(s);
+        if (optExt && *optExt)
+        {
+            size_t extLen = std::strlen(optExt);
+            if (sLen >= extLen)
+            {
+                bool extMatch = true;
+                for (size_t i = 0; i < extLen; ++i)
+                {
+                    char a = s[sLen - extLen + i];
+                    char b = optExt[i];
+                    if (a >= 'A' && a <= 'Z') a = static_cast<char>(a - 'A' + 'a');
+                    if (b >= 'A' && b <= 'Z') b = static_cast<char>(b - 'A' + 'a');
+                    if (a != b) { extMatch = false; break; }
+                }
+                if (extMatch) sLen -= extLen;
+            }
+        }
+        size_t sufLen = std::strlen(suffix);
+        if (sLen < sufLen) return false;
+        for (size_t i = 0; i < sufLen; ++i)
+        {
+            char a = s[sLen - sufLen + i];
+            char b = suffix[i];
+            if (a >= 'A' && a <= 'Z') a = static_cast<char>(a - 'A' + 'a');
+            if (b >= 'A' && b <= 'Z') b = static_cast<char>(b - 'A' + 'a');
+            if (a != b) return false;
+        }
+        return true;
     }
 
     static bool IsKnownObjectComponentFolder(const char* folder, size_t len) noexcept
@@ -919,6 +957,17 @@ namespace wxl::scripts::equipextension
         if (explicitAttach || isCollection) return attach;
         if (StartsWithCI(name, "lshoulder_") || ContainsCI(name, "_shoulder_l")) return 6;
         if (StartsWithCI(name, "rshoulder_") || ContainsCI(name, "_shoulder_r")) return 5;
+        // Custom shoulder models often aren't named with a "_shoulder_l"/"_shoulder_r" infix at
+        // all -- just a bare "_l"/"_r" side suffix right before the extension (e.g.
+        // "leather_raiddruidt2_d_01_shoulder_l.mdx" already matches above via the infix check,
+        // but simpler stems like "myitem_shoulder_left_r.mdx" or "custom_pad_l.mdx" only carry
+        // the suffix). Only applied to names that look shoulder-related to avoid false positives
+        // on unrelated "_l"/"_r"-suffixed models from other slots.
+        if (ContainsCI(name, "shoulder"))
+        {
+            if (EndsWithCI(name, "_l", ".mdx") || EndsWithCI(name, "_l", ".m2")) return 6;
+            if (EndsWithCI(name, "_r", ".mdx") || EndsWithCI(name, "_r", ".m2")) return 5;
+        }
         if (StartsWithCI(name, "collections_"))
         {
             if (ContainsCI(name, "_shoulder_l")) return 6;
