@@ -109,6 +109,13 @@ namespace wxl::scripts::equipextension
         bool        charSweepApplied = false; // set when character-model PerFrame sweep first copies bones
         bool        bbpLogDone       = false; // suppress OnBuildBonePalette remap dump after first fire
         bool        cloneBbpLogDone  = false; // suppress duplicate-ModelFrame fallback noise
+        bool        virtualPopulateFailed = false; // NeedsVirtualModel() was true but VPathPopulate
+            // could not read the real backing file (mdx/skin read failure -- see VPathPopulate log).
+            // Phase1 must NOT fall back to e.keyBuf (the raw, unpatched path) for these: that path was
+            // already proven unreadable by the same failed populate call, the native GetRenderCtx can
+            // still return a non-null placeholder/error-model context for it regardless, and feeding
+            // that placeholder into BuildBoneRemap/geoset-filter code that assumes the real collection
+            // mesh's layout is a memory-safety violation waiting to happen, not a cosmetic miss.
         uint16_t    texAnimProbeFrames = 0; // short targeted UV-animation diagnostic
         uint32_t    texAnimProbeFirst[4] = {};
         uint8_t     texAnimProbeChanged = 0;											
@@ -455,6 +462,53 @@ static EquipExtension* g_equipInstance = nullptr; // set in the constructor, use
         __except (EXCEPTION_EXECUTE_HANDLER) {}
         return result;
     }
+
+    // SEH-only wrapper: no C++ objects in this function, __try is safe.
+    // Mirrors SafeGetRenderCtx's rationale, but for DetachSlot: this is the first place in the whole
+    // porting effort where a non-virtual entry's Phase1 key has been observed to exactly match
+    // vanilla's own already-attached key (see the "hkSlotDispatch runs vanilla first" comment above
+    // Phase1). If gm2::GetRenderCtx's refcount semantics for an already-resident model differ even
+    // slightly under core 1.1 from what that get-ref-before-detach ordering assumes, our extra ref
+    // from Phase1 would be illusory and this call would free the node down to zero, leaving the
+    // dangling-pointer crash the original comment predicted for the opposite (wrong) ordering. This
+    // wrapper can't fix that if it's a real refcount regression, but it stops a fault here from
+    // taking the whole client down, and the log line pinpoints exactly which attachId faulted.
+    static void SafeDetachSlot(void* subObj, uint32_t attachId) noexcept
+    {
+        __try { gm2::DetachSlot(subObj, attachId); }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            EquipLog("  DetachSlot CRASH CAUGHT attachId=%u subObj=%p (see comment at SafeDetachSlot)",
+                     attachId, subObj);
+        }
+    }
+
+    // SEH-only wrappers: no C++ objects in these functions, __try is safe.
+    // gm2::LoadResource and gm2::BindTexSlot had zero exception protection -- the crash trail so
+    // far has ruled out GetRenderCtx and DetachSlot in turn (both already guarded, both now proven
+    // clean via logging), and the client stops dead before the very first Phase3 log line, which is
+    // printed *after* both of these calls. This is the next narrowest window to isolate.
+    static void* SafeLoadResource(const char* texBuf, int flag) noexcept
+    {
+        void* result = nullptr;
+        __try { result = gm2::LoadResource(const_cast<char*>(texBuf), flag); }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            EquipLog("  LoadResource CRASH CAUGHT tex='%s'", texBuf ? texBuf : "(null)");
+        }
+        return result;
+    }
+
+    static bool SafeBindTexSlot(void* rctx, void* tex) noexcept
+    {
+        __try { gm2::BindTexSlot(rctx, tex); return true; }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            EquipLog("  BindTexSlot CRASH CAUGHT rctx=0x%p tex=0x%p", rctx, tex);
+            return false;
+        }
+    }
+
 
     // SEH wrapper for BuildBoneRemap's pointer walks.
     // BoneRemap is a POD struct (trivially destructible), so __try is safe inside this function.
@@ -975,6 +1029,14 @@ r.count = static_cast<uint16_t>(collN);
     {
         if (customFolder && *customFolder) return customFolder;
         if (isCollection) return "Collections";
+        // Do NOT infer the folder from a "collections_" (or similar) filename prefix: the
+        // sidecar CSV (WXLItemDisplayModels.csv) proves that prefix is just a naming
+        // convention for the model's *set*, not its on-disk folder -- e.g. displayId=71052's
+        // "collections_leather_raiddruiddragon_d_01_shoulder_l.mdx" carries the "collections_"
+        // prefix but its authoritative Folder column says "Shoulder", not "Collections". The
+        // sidecar path (addSidecarModels) already passes that column through as customFolder,
+        // which is handled above; this fallback only ever applies to non-sidecar DBC-only rows,
+        // where slotFolder (the slot's own default) is the correct answer, not a name guess.
         if (StartsWithCI(name, "lshoulder_") || StartsWithCI(name, "rshoulder_") ||
             StartsWithCI(name, "shoulder_") || ContainsCI(name, "_shoulder_l") ||
             ContainsCI(name, "_shoulder_r"))
@@ -989,12 +1051,17 @@ r.count = static_cast<uint16_t>(collN);
                                                uint32_t attach) noexcept
     {
         if (explicitAttach || isCollection) return attach;
-        if (StartsWithCI(name, "lshoulder_") || ContainsCI(name, "_shoulder_l")) return 6;
-        if (StartsWithCI(name, "rshoulder_") || ContainsCI(name, "_shoulder_r")) return 5;
+        // Broadened from requiring a leading underscore (_shoulder_l/_shoulder_r) or the specific
+        // lshoulder_/rshoulder_ prefix: a plain "shoulder_l.mdx"/"shoulder_r.mdx" -- "shoulder"
+        // with no leading token at all -- previously matched none of those and fell through
+        // without an inferred attach point. Just checking for "shoulder_l"/"shoulder_r" anywhere
+        // in the name covers all of the above plus this case, without narrowing anything.
+        if (StartsWithCI(name, "lshoulder_") || ContainsCI(name, "shoulder_l")) return 6;
+        if (StartsWithCI(name, "rshoulder_") || ContainsCI(name, "shoulder_r")) return 5;
         if (StartsWithCI(name, "collections_"))
         {
-            if (ContainsCI(name, "_shoulder_l")) return 6;
-            if (ContainsCI(name, "_shoulder_r")) return 5;
+            if (ContainsCI(name, "shoulder_l")) return 6;
+            if (ContainsCI(name, "shoulder_r")) return 5;
             if (StartsWithCI(name, "collections_belt_") || ContainsCI(name, "_belt")) return 53;
         }
         if (StartsWithCI(name, "cape_")) return 12;
@@ -1620,6 +1687,19 @@ r.count = static_cast<uint16_t>(collN);
         {
             AttachEntry& e = entries[i];
             if (!NeedsVirtualModel(e)) continue;
+            // Reset every pass: AttachEntry persists across RebuildAllModels calls (it's mutated in
+            // place in g_attached[cmo], not reallocated), so a stale true here from a previous failed
+            // attempt would permanently skip this slot even after the underlying file/data problem is
+            // fixed and a later populate call succeeds. Only this pass's result should count. Done as
+            // its own pass (not inline below) because the group-dedup skip further down means a later
+            // sibling's turn in the main loop can run after the group owner already set this true for
+            // it -- resetting inline there would silently undo that.
+            e.virtualPopulateFailed = false;
+        }
+        for (size_t i = 0; i < entries.size(); ++i)
+        {
+            AttachEntry& e = entries[i];
+            if (!NeedsVirtualModel(e)) continue;
             // Skip if a sibling already processed this (keyBuf, attachId, texBuf) group.
             bool done = false;
             for (size_t j = 0; j < i; ++j)
@@ -1655,7 +1735,15 @@ r.count = static_cast<uint16_t>(collN);
                      e.keyBuf, e.texBuf, e.matTexBuf, vpathReady ? mangled : "(disabled)",
                      mergedCount, e.mergeKey);
             if (!vpathReady)
+            {
+                // Real backing file could not be read (see the VPathPopulate log line just above).
+                // Mark this whole (keyBuf, attachId, texBuf) group so Phase1 skips it outright instead
+                // of silently retrying the same already-proven-bad raw path.
+                for (auto& e2 : entries)
+                    if (NeedsVirtualModel(e2) && SameAttachModelGroup(e2, e))
+                        e2.virtualPopulateFailed = true;
                 continue;
+            }
 
             // Propagate the mangled key to all entries in this (keyBuf, attachId, texBuf) group.
             for (auto& e2 : entries)
@@ -1682,6 +1770,18 @@ r.count = static_cast<uint16_t>(collN);
         {
             AttachEntry& e = entries[i];
             if (e.renderCtx) continue;  // already set by a sibling
+            if (e.virtualPopulateFailed)
+            {
+                // The real backing file for this entry was already proven unreadable when the
+                // virtual-path population pass ran above -- do not retry via e.keyBuf. The native
+                // GetRenderCtx can return a non-null placeholder/error-model context for a path it
+                // can't actually load, and that placeholder's internal layout does not match what
+                // BuildBoneRemap/the geoset filter downstream assumes for this slot, which is what
+                // was crashing here. Skip the attach entirely instead: no model for this slot this
+                // frame is a visible miss, not a memory-safety violation.
+                EquipLog("  Phase1 SKIP (virtual populate failed) key='%s'", e.keyBuf);
+                continue;
+            }
 
             const char* p1Key = e.mangledKeyBuf[0] ? e.mangledKeyBuf : e.keyBuf;
             void* rctx = SafeGetRenderCtx(owner28, p1Key);
@@ -1706,7 +1806,9 @@ r.count = static_cast<uint16_t>(collN);
         auto detachOnce = [&](uint32_t aid) {
             if (aid == static_cast<uint32_t>(-1) || nDetached >= 22) return;
             for (uint32_t i = 0; i < nDetached; ++i) if (detached[i] == aid) return;
-            gm2::DetachSlot(subObj, aid);
+            EquipLog("  Phase2 DetachSlot attachId=%u subObj=%p", aid, subObj);
+            SafeDetachSlot(subObj, aid);
+            EquipLog("  Phase2 DetachSlot attachId=%u done", aid);
             detached[nDetached++] = aid;
         };
         for (auto& e : entries)
@@ -1760,7 +1862,9 @@ r.count = static_cast<uint16_t>(collN);
 
             if (e.texBuf[0])
             {
-                void* tex = gm2::LoadResource(e.texBuf, 0);
+                EquipLog("  Phase3[%zu] LoadResource tex='%s'", i, e.texBuf);
+                void* tex = SafeLoadResource(e.texBuf, 0);
+                EquipLog("  Phase3[%zu] LoadResource -> 0x%p", i, tex);
                 if (!tex)
                 {
                     EquipLog("  Phase3[%zu] texture load failed '%s', skip attach", i, e.texBuf);
@@ -1771,7 +1875,9 @@ r.count = static_cast<uint16_t>(collN);
                 }
                 else
                 {
-                    gm2::BindTexSlot(rctx, tex);
+                    EquipLog("  Phase3[%zu] BindTexSlot rctx=0x%p tex=0x%p", i, rctx, tex);
+                    SafeBindTexSlot(rctx, tex);
+                    EquipLog("  Phase3[%zu] BindTexSlot done", i);
                     // Do not release here. TextureCreate returns a handle that the render context
                     // continues to use after BindTexSlot; releasing immediately can recycle it and
                     // leave the attached M2 sampling the client's missing-texture green.
@@ -1821,7 +1927,7 @@ r.count = static_cast<uint16_t>(collN);
                          merged.count > 2 ? merged.ids[2] : 0,
                          merged.count > 3 ? merged.ids[3] : 0);
                 void* mdl = GuardedReadPtr(reinterpret_cast<uint8_t*>(rctx) + offsets::kOffInstModel);
-                auto* skin = mdl ? gm2::Skin(mdl) : nullptr;
+                auto* skin = mdl ? gm2::M2Model(mdl).GetSkin() : nullptr;
                 if (skin)
                 {
                     // The GPU IB was already built by kFinalizeSkin during Phase1's synchronous
@@ -1939,6 +2045,39 @@ r.count = static_cast<uint16_t>(collN);
                      static_cast<const void*>(icon2str),
                      (icon2str && reinterpret_cast<uintptr_t>(icon2str) > 0x10000 && *icon2str)
                          ? icon2str : "(empty/invalid)");
+
+            // DIAGNOSTIC ONLY -- temporary, for tracking down the character skin-composite
+            // texture-component fields (ArmUpperTexture/ArmLowerTexture/TorsoUpperTexture/
+            // TorsoLowerTexture/LegUpperTexture/LegLowerTexture/HandTexture/FootTexture etc.).
+            // Core's offsets::itemdisplayinfo table only documents Model1/Model2/Tex1/Tex2/Icon2/
+            // ParticleId -- it does not expose these fields, because nothing in this extension has
+            // ever needed to read or patch them (they drive the client's own skin compositing, not
+            // the equipped .m2's own texture-unit table, which is all VirtualPath.cpp touches).
+            // dispBuf already holds the full 256-byte native record; every 4-byte slot in a WotLK-era
+            // ItemDisplayInfo record that isn't a small integer is materialized as a char* into the
+            // live DBC string block, so probing each slot as a pointer and printing it when it looks
+            // valid (in the DBC's mapped string-block range and non-empty) lets us find the *real*
+            // field offsets for this build without guessing wrong values into a byte-patch. Remove
+            // this block once those offsets are confirmed and added to WxlOffsets.hpp properly.
+            EquipLog("  DBC raw dump (displayId=%u), scanning for texture-component string fields:", displayId);
+            for (size_t off = 0; off + 4 <= sizeof(dispBuf); off += 4)
+            {
+                uint32_t raw = 0;
+                std::memcpy(&raw, dispBuf + off, sizeof(raw));
+                if (raw <= 0x10000) continue; // too small to be a valid mapped pointer, skip quietly
+                const char* asStr = reinterpret_cast<const char*>(static_cast<uintptr_t>(raw));
+                __try
+                {
+                    if (*asStr && std::strlen(asStr) < 128)
+                        EquipLog("    off=0x%02zX raw=0x%08X str='%s'", off, raw, asStr);
+                    else
+                        EquipLog("    off=0x%02zX raw=0x%08X (unreadable/empty)", off, raw);
+                }
+                __except (EXCEPTION_EXECUTE_HANDLER)
+                {
+                    EquipLog("    off=0x%02zX raw=0x%08X (not a valid pointer)", off, raw);
+                }
+            }
         }
         else
         {
@@ -2528,7 +2667,7 @@ r.count = static_cast<uint16_t>(collN);
                 }
 
 
-                    auto* skin = gm2::Skin(model);
+                    auto* skin = gm2::M2Model(model).GetSkin();
                     EquipLog("  OnM2SkinFinalize(primary): model=0x%p skin=0x%p merged.count=%u ids=[%u %u %u %u]",
                              model, static_cast<void*>(skin), merged.count,
                              merged.count > 0 ? merged.ids[0] : 0,
@@ -2642,7 +2781,7 @@ r.count = static_cast<uint16_t>(collN);
 
             if (found)
             {
-                auto* skin = gm2::Skin(model);
+                auto* skin = gm2::M2Model(model).GetSkin();
                 EquipLog("  OnM2SkinFinalize(fallback): skin=0x%p merged.count=%u ids=[%u %u %u %u]",
                          static_cast<void*>(skin), merged.count,
                          merged.count > 0 ? merged.ids[0] : 0,

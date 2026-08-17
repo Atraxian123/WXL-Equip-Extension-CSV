@@ -28,9 +28,11 @@
 
 #include <cstdarg>
 #include <cstdint>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cctype>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -833,6 +835,59 @@ namespace wxl::scripts::equipextension
         offsets::io::Storage_FileSizeFn  g_origFileSize  = nullptr;
         offsets::io::Storage_FileCloseFn g_origFileClose = nullptr;
 
+        // Local case-insensitive substring check -- EquipExtension.cpp has its own ContainsCI, but
+        // that's a separate translation unit with no shared declaration, so this file needs its own.
+        // Used only by the temporary texturecomponents diagnostic below.
+        static bool ContainsCI(const char* haystack, const char* needle) noexcept
+        {
+            if (!haystack || !needle) return false;
+            const size_t hLen = std::strlen(haystack);
+            const size_t nLen = std::strlen(needle);
+            if (nLen == 0 || nLen > hLen) return false;
+            for (size_t i = 0; i + nLen <= hLen; ++i)
+            {
+                size_t j = 0;
+                for (; j < nLen; ++j)
+                {
+                    if (std::tolower(static_cast<unsigned char>(haystack[i + j])) !=
+                        std::tolower(static_cast<unsigned char>(needle[j])))
+                        break;
+                }
+                if (j == nLen) return true;
+            }
+            return false;
+        }
+
+        // Builds the "unisex" candidate for a TextureComponents request: strips a trailing
+        // "_F"/"_M" (either case) sitting immediately before the extension. The native client
+        // unconditionally appends this gender letter to whatever base stem is in the DBC's
+        // texture-component field, with no check for whether that stem already denotes a unisex
+        // asset (identifiable here by an embedded "_u_" segment further back in the same stem, per
+        // the on-disk naming convention this armor set actually uses) -- so for a stem that's
+        // already unisex, the client's own request is provably never going to match anything, on
+        // any build: this isn't new behavior, just a request that was always going to miss. Returns
+        // false if the name doesn't end in a recognizable "_F"/"_M" + extension (nothing to strip).
+        static bool BuildUnisexCandidate(const char* name, char* out, size_t outSz) noexcept
+        {
+            if (!name || !out || outSz == 0) return false;
+            const size_t len = std::strlen(name);
+            if (len >= outSz) return false;
+            const char* dot = nullptr;
+            for (const char* p = name; *p; ++p) if (*p == '.') dot = p;
+            if (!dot || dot < name + 2) return false;
+            const char sep = dot[-2];
+            const char gender = dot[-1];
+            if (sep != '_') return false;
+            const char g = static_cast<char>(std::tolower(static_cast<unsigned char>(gender)));
+            if (g != 'f' && g != 'm') return false;
+            const size_t stemLen = static_cast<size_t>((dot - 2) - name); // up to, not incl., "_X"
+            const size_t extLen  = std::strlen(dot);                     // ".blp" / ".TGA" etc.
+            if (stemLen + extLen >= outSz) return false;
+            std::memcpy(out, name, stemLen);
+            std::memcpy(out + stemLen, dot, extLen + 1); // include trailing '\0'
+            return true;
+        }
+
         int __stdcall FileOpenDetour(void* archive, const char* name, uint32_t flags, void** out)
         {
             std::vector<uint8_t> bytes;
@@ -846,7 +901,43 @@ namespace wxl::scripts::equipextension
                 VPathLog("  FileOpenDetour: served virtual '%s' (%p)", name, key);
                 return 1;
             }
-            return g_origFileOpen(archive, name, flags, out);
+            // TextureComponents fallback: the native client unconditionally appends "_F"/"_M" to
+            // whatever base stem sits in the DBC's texture-component field, even when that stem is
+            // already a unisex asset (embedded "_u_" mid-stem, per this content's own naming
+            // convention) with no gendered variant ever produced or shipped on disk. Such a request
+            // is provably unsatisfiable as-is on any build -- not something that changed with this
+            // port -- so intercept it here and retry the ungendered form ourselves via ReadGameFile
+            // (already proven working for every ObjectComponents texture load), independent of
+            // whatever native path the client would otherwise have used.
+            if (name && ContainsCI(name, "texturecomponents"))
+            {
+                char unisex[264];
+                if (BuildUnisexCandidate(name, unisex, sizeof(unisex)))
+                {
+                    std::vector<uint8_t> realBytes;
+                    if (ReadGameFile(unisex, realBytes))
+                    {
+                        auto handle = std::make_unique<VirtualHandle>();
+                        handle->bytes = std::move(realBytes);
+                        void* key = handle.get();
+                        LiveHandles().emplace(key, std::move(handle));
+                        if (out) *out = key;
+                        VPathLog("  FileOpenDetour: served unisex fallback '%s' -> '%s' (%p)",
+                                 name, unisex, key);
+                        return 1;
+                    }
+                    VPathLog("  FileOpenDetour: unisex fallback '%s' also not found for '%s'",
+                             unisex, name);
+                }
+            }
+            const bool isTexComponent = name && ContainsCI(name, "texturecomponents");
+            const int result = g_origFileOpen(archive, name, flags, out);
+            if (isTexComponent)
+            {
+                VPathLog("  FileOpenDetour: PASSTHROUGH texturecomponents '%s' -> result=%d out=%p",
+                         name, result, out ? *out : nullptr);
+            }
+            return result;
         }
 
         uint32_t __stdcall FileSizeDetour(void* handle, uint32_t* sizeHigh)
@@ -908,6 +999,430 @@ namespace wxl::scripts::equipextension
                 api->Log(WXL_LOG_ERROR, "equip-extension", "VirtualPath: one or more file-I/O hooks failed");
             return ok;
         }
+    }
+
+    // ─── Model offset / scale (WXLHelmOffsets.csv) ──────────────────────────────────────────────
+    // Ported from wxl-modern-assets' host/models/m2/EquipmentFixes.cpp (ApplyHelmOffset /
+    // ApplyHelmOffsetIfConfigured), which targets exactly this WotLK-compatible M2 layout already
+    // (it downports modern models INTO this format), so the struct shapes and append-a-synthesized-
+    // single-key-track technique carry over directly -- this just adds a Kind column (Helm/Other)
+    // to gate the automatic per-race/gender default, and a Scale column doing the same append-and-
+    // relink trick against each bone's scale track instead of (well, alongside) its translation track.
+    namespace fmt = wxl::structure::m2;
+
+#pragma pack(push, 1)
+    // A synthesized single-key track, appended past the model's original bytes and pointed to by
+    // one bone's M2CompBone::translation or ::scale. The outer M2Array in track.timestamps/
+    // track.values always holds exactly one M2Array<T> descriptor (the pre-Legion per-sequence
+    // indirection this client's loader expects); that inner descriptor holds the one actual key.
+    struct AppendedModelTrack
+    {
+        fmt::M2Array innerTimestamps; // 0x00 -> timestampValue
+        uint32_t     timestampValue;  // 0x08  (left at 0: the single key sits at t=0)
+        fmt::M2Array innerValues;     // 0x0C -> value
+        float        value[3];        // 0x14
+    };
+#pragma pack(pop)
+    static_assert(sizeof(AppendedModelTrack) == 0x20, "AppendedModelTrack");
+
+    // Every playable race's 2-letter model-name code; shared by ModelRaceId (which race a model's
+    // "<code><m|f>" filename suffix names) and StripRaceGenderSuffix (which trailing "_<code><m|f>"
+    // a CSV rule's model key strips).
+    constexpr const char* kRaceCodes[] = {
+        "be", "dr", "dw", "gn", "hu", "ni", "or", "sc", "ta", "tr", "sk", "go"
+    };
+
+    static bool IsRaceCode(const char* race) noexcept
+    {
+        if (!race) return false;
+        for (const char* r : kRaceCodes) if (std::strcmp(race, r) == 0) return true;
+        return false;
+    }
+
+    // Parses the trailing "<race><m|f>" (3 chars, e.g. "bef") or "<race>_<m|f>" (4 chars incl.
+    // underscore, e.g. "be_f") suffix off a model's file-name stem (before the extension). Returns
+    // false (and leaves id empty) if the name doesn't end in a recognizable race/gender suffix --
+    // callers treat that as "not a per-race-suffixed model" rather than an error.
+    static bool ModelRaceId(const char* name, char* id, size_t idSz) noexcept
+    {
+        if (!name || !id || idSz < 4) return false;
+        id[0] = '\0';
+        const size_t len = std::strlen(name);
+        const char* slash = nullptr;
+        for (const char* p = name; *p; ++p) if (*p == '\\' || *p == '/') slash = p;
+        const char* base = slash ? slash + 1 : name;
+        const char* dot = nullptr;
+        for (const char* p = base; *p; ++p) if (*p == '.') dot = p;
+        const char* end = dot ? dot : base + std::strlen(base);
+        if (end - base < 3) return false;
+
+        char raceBuf[3] = {};
+        char genderBuf = '\0';
+        if (end - base >= 4 && end[-2] == '_')
+        {
+            raceBuf[0] = end[-4]; raceBuf[1] = end[-3]; genderBuf = end[-1];
+        }
+        else
+        {
+            raceBuf[0] = end[-3]; raceBuf[1] = end[-2]; genderBuf = end[-1];
+        }
+        raceBuf[0] = static_cast<char>(std::tolower(static_cast<unsigned char>(raceBuf[0])));
+        raceBuf[1] = static_cast<char>(std::tolower(static_cast<unsigned char>(raceBuf[1])));
+        genderBuf  = static_cast<char>(std::tolower(static_cast<unsigned char>(genderBuf)));
+        if (genderBuf != 'm' && genderBuf != 'f') return false;
+        if (!IsRaceCode(raceBuf)) return false;
+        id[0] = raceBuf[0]; id[1] = raceBuf[1]; id[2] = genderBuf; id[3] = '\0';
+        return true;
+    }
+
+    struct ModelOffsetRule
+    {
+        char   model[128] = {};
+        char   raceSex[8] = {};
+        float  x = 0.0f, y = 0.0f, z = 0.0f, scale = 0.0f;
+        bool   hasX = false, hasY = false, hasZ = false, hasScale = false;
+        bool   add = true, disable = false;
+        bool   isHelm = false; // Kind column: "Helm" enables the automatic per-race/gender default
+                                // offset below; anything else ("Other"/blank) only ever applies this
+                                // row's own explicit X/Y/Z/Scale, matching ApplyHelmOffsetIfConfigured.
+    };
+
+    static bool g_modelOffsetsLoaded = false;
+    static std::vector<ModelOffsetRule> g_modelOffsetRules;
+
+    static void NormalizeOffsetKey(const char* in, char* out, size_t outSz) noexcept
+    {
+        size_t o = 0;
+        for (const char* p = in; *p && o + 1 < outSz; ++p)
+        {
+            char c = static_cast<char>(std::tolower(static_cast<unsigned char>(*p)));
+            if (c == '/') c = '\\';
+            out[o++] = c;
+        }
+        out[o] = '\0';
+        // strip a trailing .m2/.mdx extension
+        const size_t len = std::strlen(out);
+        if (len >= 3 && std::strcmp(out + len - 3, ".m2") == 0) out[len - 3] = '\0';
+        else if (len >= 4 && std::strcmp(out + len - 4, ".mdx") == 0) out[len - 4] = '\0';
+    }
+
+    static void StripRaceGenderSuffixInPlace(char* stem) noexcept
+    {
+        const size_t n = std::strlen(stem);
+        if (n >= 5 && stem[n - 5] == '_' && stem[n - 2] == '_' &&
+            (stem[n - 1] == 'm' || stem[n - 1] == 'f'))
+        {
+            char race[3] = { stem[n - 4], stem[n - 3], '\0' };
+            race[0] = static_cast<char>(std::tolower(static_cast<unsigned char>(race[0])));
+            race[1] = static_cast<char>(std::tolower(static_cast<unsigned char>(race[1])));
+            if (IsRaceCode(race)) { stem[n - 5] = '\0'; return; }
+        }
+        if (n >= 4 && stem[n - 4] == '_' && (stem[n - 1] == 'm' || stem[n - 1] == 'f'))
+        {
+            char race[3] = { stem[n - 3], stem[n - 2], '\0' };
+            race[0] = static_cast<char>(std::tolower(static_cast<unsigned char>(race[0])));
+            race[1] = static_cast<char>(std::tolower(static_cast<unsigned char>(race[1])));
+            if (IsRaceCode(race)) stem[n - 4] = '\0';
+        }
+    }
+
+    static void FileNamePart(const char* in, char* out, size_t outSz) noexcept
+    {
+        const char* slash = nullptr;
+        for (const char* p = in; *p; ++p) if (*p == '\\') slash = p;
+        const char* base = slash ? slash + 1 : in;
+        std::strncpy(out, base, outSz - 1);
+        out[outSz - 1] = '\0';
+    }
+
+    static void LoadModelOffsetsText(const char* source, const std::string& text)
+    {
+        std::vector<std::string> header;
+        size_t pos = 0;
+        {
+            const size_t nl = text.find_first_of("\r\n");
+            const std::string headerLine = text.substr(0, nl == std::string::npos ? text.size() : nl);
+            std::string field; bool quoted = false;
+            for (char c : headerLine)
+            {
+                if (quoted) { if (c == '"') quoted = false; else field.push_back(c); }
+                else if (c == '"') quoted = true;
+                else if (c == ',') { header.push_back(field); field.clear(); }
+                else field.push_back(c);
+            }
+            header.push_back(field);
+            pos = (nl == std::string::npos) ? text.size() : nl + 1;
+        }
+        auto findCol = [&](const char* name) -> int {
+            for (size_t i = 0; i < header.size(); ++i)
+            {
+                std::string h = header[i];
+                for (auto& c : h) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                std::string want = name;
+                for (auto& c : want) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                if (h == want) return static_cast<int>(i);
+            }
+            return -1;
+        };
+        const int cModel = findCol("Model");
+        const int cRaceSex = findCol("RaceSex");
+        const int cMode = findCol("Mode");
+        const int cKind = findCol("Kind");
+        const int cX = findCol("X");
+        const int cY = findCol("Y");
+        const int cZ = findCol("Z");
+        const int cScale = findCol("Scale");
+        if (cModel < 0)
+        {
+            VPathLog("  WXLHelmOffsets '%s': missing Model column, skipped", source);
+            return;
+        }
+
+        uint32_t loaded = 0;
+        while (pos < text.size())
+        {
+            const size_t nl = text.find_first_of("\r\n", pos);
+            std::string line = text.substr(pos, (nl == std::string::npos ? text.size() : nl) - pos);
+            pos = (nl == std::string::npos) ? text.size() : nl + 1;
+            if (line.empty()) continue;
+
+            std::vector<std::string> row;
+            std::string field; bool quoted = false;
+            for (char c : line)
+            {
+                if (quoted) { if (c == '"') quoted = false; else field.push_back(c); }
+                else if (c == '"') quoted = true;
+                else if (c == ',') { row.push_back(field); field.clear(); }
+                else field.push_back(c);
+            }
+            row.push_back(field);
+            auto get = [&](int col) -> std::string {
+                return (col >= 0 && static_cast<size_t>(col) < row.size()) ? row[col] : std::string();
+            };
+
+            ModelOffsetRule rule;
+            char modelKey[128];
+            NormalizeOffsetKey(get(cModel).c_str(), modelKey, sizeof(modelKey));
+            if (!modelKey[0]) continue;
+            std::strncpy(rule.model, modelKey, sizeof(rule.model) - 1);
+
+            std::string raceSex = get(cRaceSex);
+            for (auto& c : raceSex) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            if (raceSex == "all") raceSex = "*";
+            std::strncpy(rule.raceSex, raceSex.c_str(), sizeof(rule.raceSex) - 1);
+
+            std::string mode = get(cMode);
+            for (auto& c : mode) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            rule.disable = (mode == "disable" || mode == "disabled" || mode == "none" || mode == "skip");
+            rule.add = !(mode == "set" || mode == "absolute" || mode == "override");
+
+            std::string kind = get(cKind);
+            for (auto& c : kind) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            rule.isHelm = (kind == "helm");
+
+            auto parseF = [](const std::string& s, float& out) -> bool {
+                if (s.empty()) return false;
+                char* end = nullptr;
+                const float v = std::strtof(s.c_str(), &end);
+                if (end == s.c_str()) return false;
+                out = v; return true;
+            };
+            rule.hasX = parseF(get(cX), rule.x);
+            rule.hasY = parseF(get(cY), rule.y);
+            rule.hasZ = parseF(get(cZ), rule.z);
+            rule.hasScale = parseF(get(cScale), rule.scale);
+            if (!rule.disable && !rule.hasX && !rule.hasY && !rule.hasZ && !rule.hasScale && !rule.isHelm)
+                continue;
+
+            g_modelOffsetRules.push_back(rule);
+            ++loaded;
+        }
+        if (loaded) VPathLog("  WXLHelmOffsets loaded '%s' rows=%u", source, loaded);
+    }
+
+    static void LoadModelOffsets()
+    {
+        if (g_modelOffsetsLoaded) return;
+        g_modelOffsetsLoaded = true;
+        std::vector<uint8_t> bytes;
+        if (ReadGameFile("DBFilesClient\\WXLHelmOffsets.csv", bytes) && !bytes.empty())
+            LoadModelOffsetsText("DBFilesClient\\WXLHelmOffsets.csv",
+                std::string(reinterpret_cast<const char*>(bytes.data()), bytes.size()));
+        if (!g_modelOffsetRules.empty())
+            VPathLog("  WXLHelmOffsets ready rules=%zu", g_modelOffsetRules.size());
+    }
+
+    // Per-race/gender default (x, z) helm-bone offset, ported verbatim from wxl-modern-assets
+    // (calibrated by eye against each race's head proportions there). A race/gender with no entry
+    // here falls back to the human default at the table's end. y is always 0 by default.
+    struct ModelOffsetDefault { const char* id; float x, z; };
+    constexpr ModelOffsetDefault kHelmOffsetDefaults[] = {
+        { "drf", -0.0587258f, -0.195f },
+        { "drm", -0.0587258f, -0.245f },
+        { "taf", -0.13f,      -0.1f },
+        { "tam", -0.2f,       -0.1f },
+        { "nim", -0.09f,      -0.18f },
+        { "nif", -0.08f,      -0.195f },
+        { "orf", -0.08f,      -0.171f },
+        { "orm", -0.13f,      -0.21f },
+        { "trf", -0.0887258f, -0.08623257f },
+        { "trm", -0.13f,      -0.16f },
+        { "bef",  0.01f,      -0.2f },
+        { "bem", -0.08f,      -0.165f },
+        { "huf", -0.09f,      -0.18f },
+        { "scm", -0.12f,      -0.12623256f },
+        { "scf", -0.01f,      -0.15f },
+        { "gnf", -0.015f,     -0.263f },
+        { "gnm", -0.009f,     -0.23f },
+        { "dwm", -0.0227258f, -0.1725f },
+        { "dwf",  0.01f,      -0.195f },
+    };
+    constexpr ModelOffsetDefault kHelmOffsetHumanDefault{ "", -0.0587258f, -0.18623257f };
+
+    static void HelmOffsetForId(const char* id, float& x, float& z) noexcept
+    {
+        const ModelOffsetDefault* found = &kHelmOffsetHumanDefault;
+        for (const auto& entry : kHelmOffsetDefaults)
+            if (std::strcmp(entry.id, id) == 0) { found = &entry; break; }
+        x = found->x;
+        z = found->z;
+    }
+
+    static int ModelRuleScore(const ModelOffsetRule& rule, const char* pathStem, const char* pathBase,
+                              const char* fileStem, const char* fileBase, const char* raceSex) noexcept
+    {
+        if (rule.raceSex[0] && std::strcmp(rule.raceSex, "*") != 0 &&
+            std::strcmp(rule.raceSex, raceSex) != 0) return -1;
+        int score = -1;
+        if (std::strchr(rule.model, '\\'))
+        {
+            if (std::strcmp(rule.model, pathStem) == 0) score = 40;
+            else if (std::strcmp(rule.model, pathBase) == 0) score = 30;
+        }
+        else
+        {
+            if (std::strcmp(rule.model, fileStem) == 0) score = 20;
+            else if (std::strcmp(rule.model, fileBase) == 0) score = 10;
+        }
+        if (score >= 0 && rule.raceSex[0] && std::strcmp(rule.raceSex, "*") != 0) score += 5;
+        return score;
+    }
+
+    // Appends a synthesized single-key track per bone for translation and/or scale, nudging/resizing
+    // the whole model. Ported from wxl-modern-assets' InjectHelmBoneOffset, extended to also cover
+    // scale (that module only ever needed translation).
+    static bool InjectModelOffsetAndScale(const char* name, std::vector<uint8_t>& model,
+                                          bool doTranslate, float x, float y, float z,
+                                          bool doScale, float scale)
+    {
+        if (model.size() < sizeof(fmt::M2Header)) return false;
+        auto* md = reinterpret_cast<fmt::M2Header*>(model.data());
+        if (md->magic != fmt::kMagicMD20 || !md->bones.count || !md->bones.offset) return false;
+        const uint64_t bonesEnd = uint64_t(md->bones.offset) +
+                                   uint64_t(md->bones.count) * sizeof(fmt::M2CompBone);
+        const uint32_t tracksPerBone = (doTranslate ? 1u : 0u) + (doScale ? 1u : 0u);
+        if (bonesEnd > model.size() || bonesEnd < md->bones.offset || tracksPerBone == 0 ||
+            uint64_t(model.size()) + uint64_t(md->bones.count) * tracksPerBone * sizeof(AppendedModelTrack)
+                > 0xffffffffu)
+            return false;
+
+        const uint32_t boneCount = md->bones.count;
+        const uint32_t boneOffset = md->bones.offset;
+        auto boneAt = [&](uint32_t i) {
+            return reinterpret_cast<fmt::M2CompBone*>(model.data() + boneOffset + i * sizeof(fmt::M2CompBone));
+        };
+
+        for (uint32_t i = 0; i < boneCount; ++i)
+        {
+            boneAt(i)->flags |= fmt::kBoneFlagTransformed;
+
+            if (doTranslate)
+            {
+                const uint32_t trackOffset = static_cast<uint32_t>(model.size());
+                model.resize(model.size() + sizeof(AppendedModelTrack), 0);
+                auto* bone = boneAt(i);
+                auto* track = reinterpret_cast<AppendedModelTrack*>(model.data() + trackOffset);
+                bone->translation.timestamps = { 1, trackOffset };
+                track->innerTimestamps = { 1, trackOffset + offsetof(AppendedModelTrack, timestampValue) };
+                bone->translation.values = { 1, trackOffset + offsetof(AppendedModelTrack, innerValues) };
+                track->innerValues = { 1, trackOffset + offsetof(AppendedModelTrack, value) };
+                track->value[0] = x; track->value[1] = y; track->value[2] = z;
+            }
+            if (doScale)
+            {
+                const uint32_t trackOffset = static_cast<uint32_t>(model.size());
+                model.resize(model.size() + sizeof(AppendedModelTrack), 0);
+                auto* bone = boneAt(i);
+                auto* track = reinterpret_cast<AppendedModelTrack*>(model.data() + trackOffset);
+                bone->scale.timestamps = { 1, trackOffset };
+                track->innerTimestamps = { 1, trackOffset + offsetof(AppendedModelTrack, timestampValue) };
+                bone->scale.values = { 1, trackOffset + offsetof(AppendedModelTrack, innerValues) };
+                track->innerValues = { 1, trackOffset + offsetof(AppendedModelTrack, value) };
+                track->value[0] = scale; track->value[1] = scale; track->value[2] = scale;
+            }
+        }
+        VPathLog("  ModelOffset: '%s' translate=%d(%.4f,%.4f,%.4f) scale=%d(%.4f) bones=%u",
+                 name, doTranslate ? 1 : 0, x, y, z, doScale ? 1 : 0, scale, boneCount);
+        return true;
+    }
+
+    // Public entry point: called from VPathPopulate right after the real .m2 bytes are read. name
+    // is the real (pre-normalization) DBC-style path, e.g. 'Item\ObjectComponents\Head\foo_Be_F.mdx'.
+    // No-op (returns without modifying model) if nothing in WXLHelmOffsets.csv applies and the
+    // model's own filename doesn't parse as a per-race helm suffix -- i.e. touching zero bytes and
+    // zero bone flags for every model that was never meant to be offset/scaled at all.
+    static void ApplyModelOffsetAndScale(const char* name, std::vector<uint8_t>& model)
+    {
+        LoadModelOffsets();
+        if (g_modelOffsetRules.empty()) return;
+
+        char id[8] = {};
+        const bool hasRaceId = ModelRaceId(name, id, sizeof(id));
+
+        char pathStem[264]; NormalizeOffsetKey(name, pathStem, sizeof(pathStem));
+        char pathBase[264]; std::strncpy(pathBase, pathStem, sizeof(pathBase) - 1);
+        pathBase[sizeof(pathBase) - 1] = '\0'; StripRaceGenderSuffixInPlace(pathBase);
+        char fileStemBuf[264]; FileNamePart(pathStem, fileStemBuf, sizeof(fileStemBuf));
+        char fileBase[264]; std::strncpy(fileBase, fileStemBuf, sizeof(fileBase) - 1);
+        fileBase[sizeof(fileBase) - 1] = '\0'; StripRaceGenderSuffixInPlace(fileBase);
+
+        const ModelOffsetRule* best = nullptr;
+        int bestScore = -1;
+        for (const auto& rule : g_modelOffsetRules)
+        {
+            const int score = ModelRuleScore(rule, pathStem, pathBase, fileStemBuf, fileBase,
+                                             hasRaceId ? id : "");
+            if (score > bestScore) { best = &rule; bestScore = score; }
+        }
+        if (!best) return;               // no CSV row at all for this model: do nothing (opt-in)
+        if (best->disable) return;        // explicit disable: do nothing
+
+        float x = 0.0f, y = 0.0f, z = 0.0f, scale = 1.0f;
+        bool haveOffset = false, haveScale = false;
+
+        if (best->isHelm && hasRaceId)
+        {
+            float dx, dz;
+            HelmOffsetForId(id, dx, dz);
+            x = dx; z = dz; haveOffset = true;
+        }
+
+        if (best->add)
+        {
+            if (best->hasX) { x += best->x; haveOffset = true; }
+            if (best->hasY) { y += best->y; haveOffset = true; }
+            if (best->hasZ) { z += best->z; haveOffset = true; }
+        }
+        else
+        {
+            if (best->hasX) { x = best->x; haveOffset = true; }
+            if (best->hasY) { y = best->y; haveOffset = true; }
+            if (best->hasZ) { z = best->z; haveOffset = true; }
+        }
+        if (best->hasScale) { scale = best->scale; haveScale = true; }
+
+        if (!haveOffset && !haveScale) return;
+        InjectModelOffsetAndScale(name, model, haveOffset, x, y, z, haveScale, scale);
     }
 
     // ─── Public API ───────────────────────────────────────────────────────────
@@ -973,6 +1488,10 @@ namespace wxl::scripts::equipextension
             return false;
         }
         VPathLog("  VPathPopulate: mdx '%s' -> %zu bytes", normPath, mdxBytes.size());
+
+        // Model position offset / scale (WXLHelmOffsets.csv). No-op for any model with no matching
+        // CSV row -- see ApplyModelOffsetAndScale's own comment for the opt-in rationale.
+        ApplyModelOffsetAndScale(realMdxPath, mdxBytes);
 
         // Read real 00.skin bytes.
         char rSkin[264];
