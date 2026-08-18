@@ -867,26 +867,26 @@ namespace wxl::scripts::equipextension
         // already unisex, the client's own request is provably never going to match anything, on
         // any build: this isn't new behavior, just a request that was always going to miss. Returns
         // false if the name doesn't end in a recognizable "_F"/"_M" + extension (nothing to strip).
-        static bool BuildUnisexCandidate(const char* name, char* out, size_t outSz) noexcept
-        {
-            if (!name || !out || outSz == 0) return false;
-            const size_t len = std::strlen(name);
-            if (len >= outSz) return false;
-            const char* dot = nullptr;
-            for (const char* p = name; *p; ++p) if (*p == '.') dot = p;
-            if (!dot || dot < name + 2) return false;
-            const char sep = dot[-2];
-            const char gender = dot[-1];
-            if (sep != '_') return false;
-            const char g = static_cast<char>(std::tolower(static_cast<unsigned char>(gender)));
-            if (g != 'f' && g != 'm') return false;
-            const size_t stemLen = static_cast<size_t>((dot - 2) - name); // up to, not incl., "_X"
-            const size_t extLen  = std::strlen(dot);                     // ".blp" / ".TGA" etc.
-            if (stemLen + extLen >= outSz) return false;
-            std::memcpy(out, name, stemLen);
-            std::memcpy(out + stemLen, dot, extLen + 1); // include trailing '\0'
-            return true;
-        }
+//        static bool BuildUnisexCandidate(const char* name, char* out, size_t outSz) noexcept
+//        {
+//            if (!name || !out || outSz == 0) return false;
+//            const size_t len = std::strlen(name);
+//            if (len >= outSz) return false;
+//            const char* dot = nullptr;
+//            for (const char* p = name; *p; ++p) if (*p == '.') dot = p;
+//            if (!dot || dot < name + 2) return false;
+//            const char sep = dot[-2];
+//            const char gender = dot[-1];
+//            if (sep != '_') return false;
+//            const char g = static_cast<char>(std::tolower(static_cast<unsigned char>(gender)));
+//            if (g != 'f' && g != 'm') return false;
+//            const size_t stemLen = static_cast<size_t>((dot - 2) - name); // up to, not incl., "_X"
+//            const size_t extLen  = std::strlen(dot);                     // ".blp" / ".TGA" etc.
+//            if (stemLen + extLen >= outSz) return false;
+//            std::memcpy(out, name, stemLen);
+//            std::memcpy(out + stemLen, dot, extLen + 1); // include trailing '\0'
+//            return true;
+//        }
 
         int __stdcall FileOpenDetour(void* archive, const char* name, uint32_t flags, void** out)
         {
@@ -909,27 +909,27 @@ namespace wxl::scripts::equipextension
             // port -- so intercept it here and retry the ungendered form ourselves via ReadGameFile
             // (already proven working for every ObjectComponents texture load), independent of
             // whatever native path the client would otherwise have used.
-            if (name && ContainsCI(name, "texturecomponents"))
-            {
-                char unisex[264];
-                if (BuildUnisexCandidate(name, unisex, sizeof(unisex)))
-                {
-                    std::vector<uint8_t> realBytes;
-                    if (ReadGameFile(unisex, realBytes))
-                    {
-                        auto handle = std::make_unique<VirtualHandle>();
-                        handle->bytes = std::move(realBytes);
-                        void* key = handle.get();
-                        LiveHandles().emplace(key, std::move(handle));
-                        if (out) *out = key;
-                        VPathLog("  FileOpenDetour: served unisex fallback '%s' -> '%s' (%p)",
-                                 name, unisex, key);
-                        return 1;
-                    }
-                    VPathLog("  FileOpenDetour: unisex fallback '%s' also not found for '%s'",
-                             unisex, name);
-                }
-            }
+            //if (name && ContainsCI(name, "texturecomponents"))
+            //{
+            //    char unisex[264];
+            //    if (BuildUnisexCandidate(name, unisex, sizeof(unisex)))
+            //    {
+            //        std::vector<uint8_t> realBytes;
+            //        if (ReadGameFile(unisex, realBytes))
+            //        {
+            //            auto handle = std::make_unique<VirtualHandle>();
+            //            handle->bytes = std::move(realBytes);
+            //            void* key = handle.get();
+            //            LiveHandles().emplace(key, std::move(handle));
+            //            if (out) *out = key;
+            //            VPathLog("  FileOpenDetour: served unisex fallback '%s' -> '%s' (%p)",
+            //                     name, unisex, key);
+            //            return 1;
+            //        }
+            //        VPathLog("  FileOpenDetour: unisex fallback '%s' also not found for '%s'",
+            //                 unisex, name);
+            //    }
+            //}
             const bool isTexComponent = name && ContainsCI(name, "texturecomponents");
             const int result = g_origFileOpen(archive, name, flags, out);
             if (isTexComponent)
