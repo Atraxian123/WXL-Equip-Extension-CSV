@@ -271,7 +271,11 @@ namespace wxl::scripts::weaponextension
     // the same "sidecar-only" convention as WXLCreatureModels.csv.
     struct WeaponModelPaths
     {
-        std::string path[2]; // [0]=Model1Path, [1]=Model2Path; empty string = column not in use
+        std::string path[2];        // [0]=Model1Path, [1]=Model2Path; empty string = column not in use
+        std::string offhandPath[2]; // [0]=Model1OffhandPath, [1]=Model2OffhandPath; empty = no
+            // offhand-specific bake for this column -- EquipExtension falls back to the mainhand
+            // bake (path[]) when this is empty, so leaving these blank changes nothing for weapons
+            // that don't need an offhand-mirrored variant.
     };
     static std::unordered_map<uint32_t, WeaponModelPaths> g_sidecarWeaponModelPath;
 
@@ -285,7 +289,9 @@ namespace wxl::scripts::weaponextension
     };
     struct WeaponGeosetSpecs
     {
-        WeaponGeosetSpec spec[2]; // [0]=Geoset1 (for Model1Path), [1]=Geoset2 (for Model2Path)
+        WeaponGeosetSpec spec[2];        // [0]=Geoset1 (for Model1Path), [1]=Geoset2 (for Model2Path)
+        WeaponGeosetSpec offhandSpec[2]; // [0]=Geoset1Offhand (for Model1OffhandPath),
+                                          // [1]=Geoset2Offhand (for Model2OffhandPath)
     };
     static std::unordered_map<uint32_t, WeaponGeosetSpecs> g_sidecarWeaponGeoset;
 
@@ -354,6 +360,10 @@ namespace wxl::scripts::weaponextension
         const int cModel2  = FindCsvColumn(header, "Model2Path"); // optional -- blank column is fine
         const int cGeoset1 = FindCsvColumn(header, "Geoset1");    // optional -- absent is fine, not an error
         const int cGeoset2 = FindCsvColumn(header, "Geoset2");    // optional -- absent is fine, not an error
+        const int cModel1Oh = FindCsvColumn(header, "Model1OffhandPath"); // optional -- see
+        const int cModel2Oh = FindCsvColumn(header, "Model2OffhandPath"); // WeaponModelPaths::offhandPath
+        const int cGeoset1Oh = FindCsvColumn(header, "Geoset1Offhand");   // optional -- see
+        const int cGeoset2Oh = FindCsvColumn(header, "Geoset2Offhand");   // WeaponGeosetSpecs::offhandSpec
 
         if (cDisplay < 0 || cModel1 < 0)
         {
@@ -388,14 +398,29 @@ namespace wxl::scripts::weaponextension
                 CopyString(model2, sizeof(model2), CsvField(row, cModel2));
                 entry.path[1] = model2; // stays empty if the column is blank/absent
             }
+            if (cModel1Oh >= 0)
+            {
+                char model1Oh[264] = {};
+                CopyString(model1Oh, sizeof(model1Oh), CsvField(row, cModel1Oh));
+                entry.offhandPath[0] = model1Oh; // stays empty if blank/absent -- no offhand
+                                                   // override for column 0, mainhand bake used as-is
+            }
+            if (cModel2Oh >= 0)
+            {
+                char model2Oh[264] = {};
+                CopyString(model2Oh, sizeof(model2Oh), CsvField(row, cModel2Oh));
+                entry.offhandPath[1] = model2Oh;
+            }
 
             g_sidecarWeaponModelPath.emplace(displayId, std::move(entry));
 
-            if (cGeoset1 >= 0 || cGeoset2 >= 0)
+            if (cGeoset1 >= 0 || cGeoset2 >= 0 || cGeoset1Oh >= 0 || cGeoset2Oh >= 0)
             {
                 WeaponGeosetSpecs geo;
                 if (cGeoset1 >= 0) geo.spec[0] = ParseWeaponGeosetSpec(CsvField(row, cGeoset1));
                 if (cGeoset2 >= 0) geo.spec[1] = ParseWeaponGeosetSpec(CsvField(row, cGeoset2));
+                if (cGeoset1Oh >= 0) geo.offhandSpec[0] = ParseWeaponGeosetSpec(CsvField(row, cGeoset1Oh));
+                if (cGeoset2Oh >= 0) geo.offhandSpec[1] = ParseWeaponGeosetSpec(CsvField(row, cGeoset2Oh));
                 g_sidecarWeaponGeoset.emplace(displayId, geo);
             }
 
@@ -615,6 +640,80 @@ namespace wxl::scripts::weaponextension
         return registered && vModelPath[0];
     }
 
+    // Cache of already-baked offhand-mirror virtual paths, filled by BakeWeaponDisplayOffhand and
+    // read back by the public WeaponGetOffhandVirtualPath accessor (EquipExtension.cpp calls that,
+    // not this map, directly -- separate translation unit).
+    static std::unordered_map<uint64_t, std::string> g_offhandVirtualPath;
+    static uint64_t OffhandCacheKey(uint32_t displayId, uint32_t column) noexcept
+    {
+        return (static_cast<uint64_t>(displayId) << 8) | column;
+    }
+
+    // Offhand counterpart to BakeWeaponDisplay. Reads WeaponModelPaths::offhandPath /
+    // WeaponGeosetSpecs::offhandSpec instead of the mainhand columns, and -- unlike
+    // BakeWeaponDisplay -- bakes unconditionally (forceBake=true) whenever an offhand path is
+    // present at all, even with no texture rows and no geoset filter: the whole point of this call
+    // is to serve a DIFFERENT real file (the caller's pre-baked mirrored model) under its own
+    // virtual name, not to patch bytes, so "nothing to patch" is not a reason to skip it the way it
+    // is for BakeWeaponDisplay's own guard. On success, caches the virtual path in
+    // g_offhandVirtualPath for WeaponGetOffhandVirtualPath to read back.
+    static bool BakeWeaponDisplayOffhand(uint32_t displayId, uint32_t modelColumn)
+    {
+        auto pathIt = g_sidecarWeaponModelPath.find(displayId);
+        if (pathIt == g_sidecarWeaponModelPath.end()) return false;
+        if (modelColumn > 1 || pathIt->second.offhandPath[modelColumn].empty()) return false;
+
+        char matSpec[2048] = {};
+        BuildWeaponMaterialPatchSpec(matSpec, sizeof(matSpec), displayId, modelColumn);
+
+        const WeaponGeosetSpec* geoSpec = nullptr;
+        auto geoIt = g_sidecarWeaponGeoset.find(displayId);
+        if (geoIt != g_sidecarWeaponGeoset.end() && geoIt->second.offhandSpec[modelColumn].count > 0)
+            geoSpec = &geoIt->second.offhandSpec[modelColumn];
+
+        char vModelPath[280] = {};
+        bool registered = VPathPopulateGlobal(pathIt->second.offhandPath[modelColumn].c_str(), displayId,
+                                               nullptr, matSpec,
+                                               geoSpec ? geoSpec->ids : nullptr,
+                                               geoSpec ? geoSpec->count : 0,
+                                               true, // evictable -- rebaked lazily the same as mainhand
+                                               vModelPath, sizeof(vModelPath),
+                                               "Weapon",
+                                               true); // forceBake -- see this function's own comment
+        WeaponLog("  bake(offhand): display=%u column=%u real='%s' vpath='%s' spec='%s' geoCount=%u "
+                  "registered=%d",
+                  displayId, modelColumn, pathIt->second.offhandPath[modelColumn].c_str(), vModelPath,
+                  matSpec, geoSpec ? geoSpec->count : 0u, registered ? 1 : 0);
+
+        if (registered && vModelPath[0])
+        {
+            g_offhandVirtualPath[OffhandCacheKey(displayId, modelColumn)] = vModelPath;
+            return true;
+        }
+        return false;
+    }
+
+    bool WeaponGetOffhandVirtualPath(uint32_t displayId, uint32_t column, char* out, size_t outSz)
+    {
+        if (!out || outSz == 0 || column > 1) return false;
+        LoadWeaponSidecar(); // no-op after the first call; guards against this being called before
+                              // WeaponExtension's own OnModelLoadPre has ever fired
+        auto it = g_offhandVirtualPath.find(OffhandCacheKey(displayId, column));
+        if (it == g_offhandVirtualPath.end())
+        {
+            // Not baked yet -- either [EagerPreload] Weapons is off, or this is a rare timing case
+            // eager preload missed. Try baking it now, on the spot, same fallback role
+            // WeaponLazyResolve plays for the mainhand columns.
+            if (!BakeWeaponDisplayOffhand(displayId, column)) return false;
+            it = g_offhandVirtualPath.find(OffhandCacheKey(displayId, column));
+            if (it == g_offhandVirtualPath.end()) return false;
+        }
+        if (it->second.size() >= outSz) return false;
+        std::memcpy(out, it->second.c_str(), it->second.size() + 1);
+        return true;
+    }
+
+
     // Walks every displayId listed in WXLWeaponModels.csv and bakes both of its columns (whichever
     // are non-empty and have a matching texture row and/or geoset filter -- see BakeWeaponDisplay)
     // into the process-lifetime override table under the exact virtual .m2 names ItemModelData.dbc's
@@ -637,17 +736,20 @@ namespace wxl::scripts::weaponextension
                   g_sidecarWeaponModelPath.size(), g_sidecarWeaponTextures.size());
 
         uint32_t registeredCount = 0;
+        uint32_t offhandRegisteredCount = 0;
         for (const auto& [displayId, paths] : g_sidecarWeaponModelPath)
         {
             for (uint32_t col = 0; col < 2; ++col)
             {
                 if (paths.path[col].empty()) continue;
                 if (BakeWeaponDisplay(displayId, col)) ++registeredCount;
+                if (!paths.offhandPath[col].empty() && BakeWeaponDisplayOffhand(displayId, col))
+                    ++offhandRegisteredCount;
             }
         }
 
         WeaponLog("weapon preregister: done, %u display/column combo(s) registered ahead of first "
-                  "equip", registeredCount);
+                  "equip, %u offhand-mirror combo(s) registered", registeredCount, offhandRegisteredCount);
     }
 
     // Lazy on-demand counterpart to PreregisterSidecarWeapons, registered with VirtualPath.cpp via

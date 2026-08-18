@@ -61,4 +61,18 @@ namespace wxl::scripts::weaponextension
         // for good: the next load of it simply misses and WeaponLazyResolve rebakes it on the spot.
         void OnModelLoadPre(const wxl::events::ModelLoadArgs& a);
     };
+
+    /**
+     * @brief Looks up the already-baked offhand-mirror virtual .m2 path for (displayId, column), if
+     *        WXLWeaponModels.csv's Model1OffhandPath/Model2OffhandPath supplied one for it. Baked
+     *        eagerly alongside the mainhand columns (see PreregisterSidecarWeapons) and lazily on
+     *        miss the same way (see WeaponLazyResolve) -- by the time anything could call this, the
+     *        answer is either already cached or the sidecar genuinely has nothing for this column.
+     * @param column 0 = Model1OffhandPath, 1 = Model2OffhandPath.
+     * @return true and fills out/outSz if a baked offhand virtual path exists for this
+     *         (displayId, column); false (out left untouched) if this weapon has no offhand-specific
+     *         model configured at all, in which case the caller should fall back to whatever
+     *         ItemModelData.dbc's Model1/Model2 already names (the mainhand bake, unchanged).
+     */
+    bool WeaponGetOffhandVirtualPath(uint32_t displayId, uint32_t column, char* out, size_t outSz);
 }

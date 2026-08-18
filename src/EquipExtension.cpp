@@ -20,6 +20,7 @@
 #include "WxlOffsets.hpp"
 #include "VirtualPath.hpp"
 #include "common/Log.hpp"
+#include "engine/assets/shared/common/Text.hpp"
 #include "engine/events/Event.hpp"
 #include "game/Binding.hpp"
 #include "game/Io.hpp"
@@ -1049,25 +1050,50 @@ r.count = static_cast<uint16_t>(collN);
     static uint32_t InferObjectComponentAttach(const char* name, bool isCollection,
                                                bool explicitAttach,
                                                uint32_t attach) noexcept
-    {
+ {
         if (explicitAttach || isCollection) return attach;
-        // Broadened from requiring a leading underscore (_shoulder_l/_shoulder_r) or the specific
-        // lshoulder_/rshoulder_ prefix: a plain "shoulder_l.mdx"/"shoulder_r.mdx" -- "shoulder"
-        // with no leading token at all -- previously matched none of those and fell through
-        // without an inferred attach point. Just checking for "shoulder_l"/"shoulder_r" anywhere
-        // in the name covers all of the above plus this case, without narrowing anything.
-        if (StartsWithCI(name, "lshoulder_") || ContainsCI(name, "shoulder_l")) return 6;
-        if (StartsWithCI(name, "rshoulder_") || ContainsCI(name, "shoulder_r")) return 5;
-        if (StartsWithCI(name, "collections_"))
+        if (ContainsCI(name, "lshoulder_") || ContainsCI(name, "_shoulder_l")) return 6;
+        if (ContainsCI(name, "rshoulder_") || ContainsCI(name, "_shoulder_r")) return 5;
+        // Custom shoulder models often aren't named with a "_shoulder_l"/"_shoulder_r" infix at
+        // all -- just a bare "_l"/"_r" side suffix right before the extension (e.g.
+        // "leather_raiddruidt2_d_01_shoulder_l.mdx" already matches above via the infix check,
+        // but simpler stems like "myitem_shoulder_left_r.mdx" or "custom_pad_l.mdx" only carry
+        // the suffix). Only applied to names that look shoulder-related to avoid false positives
+        // on unrelated "_l"/"_r"-suffixed models from other slots.
+        if (ContainsCI(name, "shoulder"))
         {
-            if (ContainsCI(name, "shoulder_l")) return 6;
-            if (ContainsCI(name, "shoulder_r")) return 5;
-            if (StartsWithCI(name, "collections_belt_") || ContainsCI(name, "_belt")) return 53;
+            if (ContainsCI(name, "_l.") || ContainsCI(name, "_l_")) return 6;
+            if (ContainsCI(name, "_r.") || ContainsCI(name, "_r_")) return 5;
         }
-        if (StartsWithCI(name, "cape_")) return 12;
-        if (StartsWithCI(name, "tabard_")) return 34;
+        if (ContainsCI(name, "collections_"))
+        {
+            if (ContainsCI(name, "_shoulder_l")) return 6;
+            if (ContainsCI(name, "_shoulder_r")) return 5;
+            if (ContainsCI(name, "collections_belt_") || ContainsCI(name, "_belt")) return 53;
+        }
+        if (ContainsCI(name, "cape_")) return 12;
+        if (ContainsCI(name, "tabard_")) return 34;
         return attach;
     }
+//    {
+//        if (explicitAttach || isCollection) return attach;
+//        // Broadened from requiring a leading underscore (_shoulder_l/_shoulder_r) or the specific
+//        // lshoulder_/rshoulder_ prefix: a plain "shoulder_l.mdx"/"shoulder_r.mdx" -- "shoulder"
+//        // with no leading token at all -- previously matched none of those and fell through
+//        // without an inferred attach point. Just checking for "shoulder_l"/"shoulder_r" anywhere
+//        // in the name covers all of the above plus this case, without narrowing anything.
+//        if (StartsWithCI(name, "lshoulder_") || ContainsCI(name, "shoulder_l")) return 6;
+//        if (StartsWithCI(name, "rshoulder_") || ContainsCI(name, "shoulder_r")) return 5;
+//        if (StartsWithCI(name, "collections_"))
+//        {
+//            if (ContainsCI(name, "shoulder_l")) return 6;
+//            if (ContainsCI(name, "shoulder_r")) return 5;
+//            if (StartsWithCI(name, "collections_belt_") || ContainsCI(name, "_belt")) return 53;
+//        }
+//        if (StartsWithCI(name, "cape_")) return 12;
+//        if (StartsWithCI(name, "tabard_")) return 34;
+//        return attach;
+//    }
 
     static bool SlotAllowsNormalObjectModel(uint32_t modelSlot) noexcept
     {
@@ -1991,8 +2017,73 @@ r.count = static_cast<uint16_t>(collN);
         LoadSidecarModels(); // no-op after the first call
     }
 
+    // Offhand weapon-mirror override. This client has no native offhand model mirroring (a weapon
+    // dual-wielded in the offhand renders identically to mainhand, backwards-looking blade/hilt and
+    // all), so instead of runtime geometry mirroring -- which would also need every vertex, normal,
+    // triangle winding, bone pivot, translation/rotation keyframe across every animation sequence,
+    // and attachment point re-derived correctly, a large and failure-prone undertaking -- this
+    // swaps in a separately, correctly pre-baked mirrored model, authored and supplied externally
+    // (WXLWeaponModels.csv's Model1OffhandPath/Model2OffhandPath/Geoset1Offhand/Geoset2Offhand).
+    //
+    // ASSUMPTION FLAGGED FOR VERIFICATION: attach IDs 0 (mainhand/ITEM_VISUAL0) and 1
+    // (offhand/ITEM_VISUAL1) below are the standard WoW client attachment-point convention, not
+    // something confirmed against this specific client build/offset table the way every other
+    // attach ID in this file (kSlotConfig, InferObjectComponentAttach) has been. If the offhand
+    // weapon doesn't swap to the mirrored model, or swaps but attaches to the wrong hand bone, this
+    // is the first thing to check.
+    [[maybe_unused]] constexpr uint32_t kWeaponAttachMainHand = 0; // documents the pairing; only
+                                                                     // kWeaponAttachOffHand is used below
+    constexpr uint32_t kWeaponAttachOffHand  = 1;
+
+    static void HandleOffhandWeaponOverride(void* cmo, void* subObj, uint32_t displayId)
+    {
+        if (!subObj || displayId == 0) return; // unequip: nothing to override, native detach handles it
+
+        char vPath[2][280] = {};
+        const bool has0 = wxl::scripts::weaponextension::WeaponGetOffhandVirtualPath(displayId, 0, vPath[0], sizeof(vPath[0]));
+        const bool has1 = wxl::scripts::weaponextension::WeaponGetOffhandVirtualPath(displayId, 1, vPath[1], sizeof(vPath[1]));
+        if (!has0 && !has1) return; // no offhand-mirror configured for this weapon -- leave native
+                                     // vanilla attach (the mainhand bake) exactly as it already is
+
+        EquipLog("  HandleOffhandWeaponOverride: displayId=%u col0='%s' col1='%s'",
+                 displayId, has0 ? vPath[0] : "(none)", has1 ? vPath[1] : "(none)");
+
+        // hkSlotDispatch already ran vanilla first (same ordering as every other slot -- see the
+        // comment above Phase1 in RebuildAllModels) and attached the WRONG (mainhand-baked) model
+        // at the offhand attach point before this handler ever runs. Detach it, then attach the
+        // correct mirrored bake(s) in its place. Get our ref before detaching, same rationale as
+        // Phase1/Phase2 for armor -- see that comment for the full explanation of why the ordering
+        // matters.
+        void* rctx[2] = { nullptr, nullptr };
+        if (has0) rctx[0] = SafeGetRenderCtx(subObj, vPath[0]);
+        if (has1) rctx[1] = SafeGetRenderCtx(subObj, vPath[1]);
+        if (!rctx[0] && !rctx[1])
+        {
+            EquipLog("  HandleOffhandWeaponOverride: GetRenderCtx failed for both columns, aborting");
+            return;
+        }
+
+        SafeDetachSlot(subObj, kWeaponAttachOffHand);
+
+        if (rctx[0]) gm2::AttachToScene(rctx[0], subObj, kWeaponAttachOffHand, false);
+        if (rctx[1]) gm2::AttachToScene(rctx[1], subObj, kWeaponAttachOffHand, false);
+        EquipLog("  HandleOffhandWeaponOverride: attached mirrored model(s) at offhand attach point");
+    }
+
     void EquipExtension::OnItemSlotChange(const ev::ItemSlotChangeArgs& a)
     {
+        if (a.modelSlot == 16) // OffHand -- see HandleOffhandWeaponOverride's own comment. Handled
+                                // separately from, and before, the armor-only cutoff just below:
+                                // a weapon slot has exactly one attach point and none of the
+                                // multi-entry/geoset-merge machinery below (entries/Phase1-3) applies.
+                                // Purely additive on top of whatever native/WeaponExtension handling
+                                // already happens for this slot -- falls through to the cutoff after.
+        {
+            void* subObjEarly = GuardedReadPtr(reinterpret_cast<uint8_t*>(a.charModelObj) +
+                                                offsets::kOffCmoSceneNode);
+            uint32_t displayIdEarly = a.itemDataPtr ? GuardedReadU32(a.itemDataPtr) : 0;
+            HandleOffhandWeaponOverride(a.charModelObj, subObjEarly, displayIdEarly);
+        }
         if (a.modelSlot >= 14) return;
         const SlotConfig& cfg = kSlotConfig[a.modelSlot];
 

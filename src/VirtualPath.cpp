@@ -1547,13 +1547,13 @@ namespace wxl::scripts::equipextension
                              const char* texPath, const char* materialPatchSpec,
                              const uint16_t* geoIds, uint32_t geoCount, bool evictable,
                              char* outVirtualPath, size_t outVirtualPathSz,
-                             const char* evictionPool)
+                             const char* evictionPool, bool forceBake)
     {
         if (!realMdxPath || !*realMdxPath) return false;
         const bool hasTexPath = texPath && *texPath;
         const bool hasMatSpec = materialPatchSpec && *materialPatchSpec;
         const bool hasGeoFilter = geoIds && geoCount > 0;
-        if (!hasTexPath && !hasMatSpec && !hasGeoFilter) return false;
+        if (!forceBake && !hasTexPath && !hasMatSpec && !hasGeoFilter) return false;
 
         // Normalise to the same lowercase/.m2 form the host uses for real file I/O -- this is
         // still what gets read off disk below -- then mangle in itemDisplayId to get the actual

@@ -170,7 +170,14 @@ namespace wxl::scripts::equipextension
                              const uint16_t* geoIds = nullptr, uint32_t geoCount = 0,
                              bool evictable = false,
                              char* outVirtualPath = nullptr, size_t outVirtualPathSz = 0,
-                             const char* evictionPool = "Creature");
+                             const char* evictionPool = "Creature",
+                             bool forceBake = false);
+    // forceBake: bypasses the "nothing to change" guard (normally, a call with no texPath, no
+    // materialPatchSpec, and no geoset filter is a no-op, since there'd be nothing to actually
+    // patch versus just naming the real file directly). Set true when the caller's whole reason for
+    // baking is to serve a DIFFERENT real file under its own virtual key -- e.g. an offhand-mirrored
+    // weapon model with identical textures to its mainhand counterpart -- where the point isn't to
+    // patch anything, just to mint a distinct virtual name pointing at different bytes on disk.
 
     /**
      * @brief Signature for a lazy-bake resolver registered via VPathRegisterLazyResolver.
