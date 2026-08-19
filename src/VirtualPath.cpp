@@ -858,36 +858,6 @@ namespace wxl::scripts::equipextension
             return false;
         }
 
-        // Builds the "unisex" candidate for a TextureComponents request: strips a trailing
-        // "_F"/"_M" (either case) sitting immediately before the extension. The native client
-        // unconditionally appends this gender letter to whatever base stem is in the DBC's
-        // texture-component field, with no check for whether that stem already denotes a unisex
-        // asset (identifiable here by an embedded "_u_" segment further back in the same stem, per
-        // the on-disk naming convention this armor set actually uses) -- so for a stem that's
-        // already unisex, the client's own request is provably never going to match anything, on
-        // any build: this isn't new behavior, just a request that was always going to miss. Returns
-        // false if the name doesn't end in a recognizable "_F"/"_M" + extension (nothing to strip).
-//        static bool BuildUnisexCandidate(const char* name, char* out, size_t outSz) noexcept
-//        {
-//            if (!name || !out || outSz == 0) return false;
-//            const size_t len = std::strlen(name);
-//            if (len >= outSz) return false;
-//            const char* dot = nullptr;
-//            for (const char* p = name; *p; ++p) if (*p == '.') dot = p;
-//            if (!dot || dot < name + 2) return false;
-//            const char sep = dot[-2];
-//            const char gender = dot[-1];
-//            if (sep != '_') return false;
-//            const char g = static_cast<char>(std::tolower(static_cast<unsigned char>(gender)));
-//            if (g != 'f' && g != 'm') return false;
-//            const size_t stemLen = static_cast<size_t>((dot - 2) - name); // up to, not incl., "_X"
-//            const size_t extLen  = std::strlen(dot);                     // ".blp" / ".TGA" etc.
-//            if (stemLen + extLen >= outSz) return false;
-//            std::memcpy(out, name, stemLen);
-//            std::memcpy(out + stemLen, dot, extLen + 1); // include trailing '\0'
-//            return true;
-//        }
-
         int __stdcall FileOpenDetour(void* archive, const char* name, uint32_t flags, void** out)
         {
             std::vector<uint8_t> bytes;
@@ -901,35 +871,6 @@ namespace wxl::scripts::equipextension
                 VPathLog("  FileOpenDetour: served virtual '%s' (%p)", name, key);
                 return 1;
             }
-            // TextureComponents fallback: the native client unconditionally appends "_F"/"_M" to
-            // whatever base stem sits in the DBC's texture-component field, even when that stem is
-            // already a unisex asset (embedded "_u_" mid-stem, per this content's own naming
-            // convention) with no gendered variant ever produced or shipped on disk. Such a request
-            // is provably unsatisfiable as-is on any build -- not something that changed with this
-            // port -- so intercept it here and retry the ungendered form ourselves via ReadGameFile
-            // (already proven working for every ObjectComponents texture load), independent of
-            // whatever native path the client would otherwise have used.
-            //if (name && ContainsCI(name, "texturecomponents"))
-            //{
-            //    char unisex[264];
-            //    if (BuildUnisexCandidate(name, unisex, sizeof(unisex)))
-            //    {
-            //        std::vector<uint8_t> realBytes;
-            //        if (ReadGameFile(unisex, realBytes))
-            //        {
-            //            auto handle = std::make_unique<VirtualHandle>();
-            //            handle->bytes = std::move(realBytes);
-            //            void* key = handle.get();
-            //            LiveHandles().emplace(key, std::move(handle));
-            //            if (out) *out = key;
-            //            VPathLog("  FileOpenDetour: served unisex fallback '%s' -> '%s' (%p)",
-            //                     name, unisex, key);
-            //            return 1;
-            //        }
-            //        VPathLog("  FileOpenDetour: unisex fallback '%s' also not found for '%s'",
-            //                 unisex, name);
-            //    }
-            //}
             const bool isTexComponent = name && ContainsCI(name, "texturecomponents");
             const int result = g_origFileOpen(archive, name, flags, out);
             if (isTexComponent)
@@ -1425,6 +1366,262 @@ namespace wxl::scripts::equipextension
         InjectModelOffsetAndScale(name, model, haveOffset, x, y, z, haveScale, scale);
     }
 
+    // ─── Full geometric weapon mirroring (auto offhand fallback) ───────────────────────────────
+    // Mirrors a mainhand weapon's .m2 + .skin bytes across the X axis for correct offhand display,
+    // used only when WXLWeaponModels.csv has no explicit Model1OffhandPath/Model2OffhandPath for
+    // this displayId -- an explicit hand-baked override always wins (see WeaponGetOffhandVirtualPath
+    // in WeaponExtension.cpp). Struct layouts below cross-checked against M2AlastorOne.bt (010
+    // Editor template, "Tested on 3.3.5 / 7.0.1 / 8.0.1 / 9.0.1 / 9.2.0"), the parts core's own
+    // M2Format.hpp doesn't define (M2Vertex, M2Attachment, the compressed rotation quaternion).
+
+#pragma pack(push, 1)
+    // 0x30 bytes, unchanged since Classic. Position@0x00, BoneWeight@0x0C, BoneIndices@0x10,
+    // Normal@0x14, TexCoord1@0x20, TexCoord2@0x28.
+    struct M2VertexRaw
+    {
+        float   position[3];    // 0x00
+        uint8_t boneWeight[4];  // 0x0C
+        uint8_t boneIndices[4]; // 0x10
+        float   normal[3];      // 0x14
+        float   texCoord1[2];   // 0x20
+        float   texCoord2[2];   // 0x28
+    };
+    static_assert(sizeof(M2VertexRaw) == 0x30, "M2VertexRaw");
+
+    // ID(u32) + ParentBone(u32) + Position(C3Vector) + an int M2Track ("has been 1 on all models",
+    // per the template's own comment -- never touched here, only Position is).
+    struct M2AttachmentRaw
+    {
+        uint32_t id;                 // 0x00
+        uint32_t parentBone;         // 0x04
+        float    position[3];        // 0x08
+        fmt::M2TrackHeader data;     // 0x14 (untouched)
+    };
+    static_assert(sizeof(M2AttachmentRaw) == 0x14 + sizeof(fmt::M2TrackHeader), "M2AttachmentRaw");
+
+    // Raw on-disk .skin file header. Stable, well-documented WotLK+ layout: magic "SKIN", then five
+    // M2Array blocks (vertex-lookup indices, triangle indices, vertex properties, submeshes, texture
+    // units), then a bone-influence cap. NOTE: unlike the vertex/attachment/quaternion structs above,
+    // this one isn't independently re-derived from the uploaded .bt template in this session (that
+    // template only covers .m2, not .skin) -- it's from established prior knowledge of the format,
+    // not a fresh source check the way everything else here was. If mirrored weapons render with
+    // visibly inside-out faces, this is the first thing to re-verify.
+    struct M2SkinHeaderRaw
+    {
+        char     magic[4];       // "SKIN"
+        fmt::M2Array indices;    // 0x04  vertex-lookup table (uint16, -> m2 vertex array)
+        fmt::M2Array triangles;  // 0x0C  uint16 triples, indices INTO the table above (not m2 verts)
+        fmt::M2Array properties; // 0x14  uint8 per entry in indices[]
+        fmt::M2Array submeshes;  // 0x1C
+        fmt::M2Array textureUnits; // 0x24
+        uint32_t boneCountMax;   // 0x2C
+    };
+    static_assert(sizeof(M2SkinHeaderRaw) == 0x30, "M2SkinHeaderRaw");
+#pragma pack(pop)
+
+    // Mirrors a compressed rotation quaternion (4x uint16, decoded as (v/32767.0)-1.0) across the X
+    // axis. Derivation: mirroring negates the X component of every vector; for a rotation R to look
+    // correctly mirrored we need R' = m*R*m (m = diag(-1,1,1)), which works out to negating the two
+    // quaternion components NOT on the mirrored axis, leaving the mirrored-axis component and w
+    // unchanged: q' = (qx, -qy, -qz, qw). Checked against two cases: a Z-axis rotation correctly
+    // flips to -theta (mirrors reverse in-plane rotation handedness); a rotation about X itself (the
+    // mirror's own axis) comes out unchanged (the axis-flip and handedness-reversal cancel).
+    static void MirrorCompressedQuatX(uint16_t& x, uint16_t& y, uint16_t& z, uint16_t& /*w*/) noexcept
+    {
+        constexpr float kMaxShort = 32767.0f;
+        auto stf = [&](uint16_t v) { return (static_cast<float>(v) / kMaxShort) - 1.0f; };
+        auto fts = [&](float f) {
+            float v = (f + 1.0f) * kMaxShort;
+            if (v < 0.0f) v = 0.0f;
+            if (v > 65535.0f) v = 65535.0f;
+            return static_cast<uint16_t>(v + 0.5f);
+        };
+        y = fts(-stf(y));
+        z = fts(-stf(z));
+        // x, w untouched
+    }
+
+    // Negates the X component of every value in a translation (C3Vector) or rotation (compressed
+    // quaternion) track, across every sequence -- walks the same nested M2Array-of-M2Array
+    // indirection the offset-injection code above appends new data into, except here the data
+    // already exists in the model and is being rewritten in place (no resize, no relinking).
+    static void MirrorTranslationTrack(std::vector<uint8_t>& model, const fmt::M2TrackHeader& track)
+    {
+        if (!track.timestamps.count || !track.values.count) return;
+        const uint64_t outerEnd = uint64_t(track.values.offset) +
+                                   uint64_t(track.values.count) * sizeof(fmt::M2Array);
+        if (outerEnd > model.size()) return;
+        auto* outer = reinterpret_cast<fmt::M2Array*>(model.data() + track.values.offset);
+        for (uint32_t s = 0; s < track.values.count; ++s)
+        {
+            const uint64_t innerEnd = uint64_t(outer[s].offset) +
+                                       uint64_t(outer[s].count) * (sizeof(float) * 3);
+            if (!outer[s].count || innerEnd > model.size()) continue;
+            auto* vals = reinterpret_cast<float*>(model.data() + outer[s].offset);
+            for (uint32_t k = 0; k < outer[s].count; ++k) vals[k * 3 + 0] = -vals[k * 3 + 0];
+        }
+    }
+
+    static void MirrorRotationTrack(std::vector<uint8_t>& model, const fmt::M2TrackHeader& track)
+    {
+        if (!track.timestamps.count || !track.values.count) return;
+        const uint64_t outerEnd = uint64_t(track.values.offset) +
+                                   uint64_t(track.values.count) * sizeof(fmt::M2Array);
+        if (outerEnd > model.size()) return;
+        auto* outer = reinterpret_cast<fmt::M2Array*>(model.data() + track.values.offset);
+        for (uint32_t s = 0; s < track.values.count; ++s)
+        {
+            const uint64_t innerEnd = uint64_t(outer[s].offset) +
+                                       uint64_t(outer[s].count) * (sizeof(uint16_t) * 4);
+            if (!outer[s].count || innerEnd > model.size()) continue;
+            auto* vals = reinterpret_cast<uint16_t*>(model.data() + outer[s].offset);
+            for (uint32_t k = 0; k < outer[s].count; ++k)
+                MirrorCompressedQuatX(vals[k * 4 + 0], vals[k * 4 + 1], vals[k * 4 + 2], vals[k * 4 + 3]);
+        }
+    }
+
+    // Mirrors vertex positions/normals, bone pivots + translation/rotation keyframes (every
+    // sequence, not just a synthesized key), attachment offsets, and bounding volumes. Does NOT
+    // touch scale tracks (scale is an unsigned magnitude, not a signed direction -- the mirror is
+    // already fully expressed by the position/rotation changes above it). Returns false (model left
+    // untouched) on any bounds-check failure, matching the append-side injection code's own
+    // fail-closed convention.
+    static bool MirrorModelBytes(const char* name, std::vector<uint8_t>& model) noexcept
+    {
+        if (model.size() < sizeof(fmt::M2Header)) return false;
+        auto* md = reinterpret_cast<fmt::M2Header*>(model.data());
+        if (md->magic != fmt::kMagicMD20) return false;
+
+        __try
+        {
+            // Vertices
+            if (md->vertices.count)
+            {
+                const uint64_t end = uint64_t(md->vertices.offset) +
+                                      uint64_t(md->vertices.count) * sizeof(M2VertexRaw);
+                if (end > model.size()) return false;
+                auto* v = reinterpret_cast<M2VertexRaw*>(model.data() + md->vertices.offset);
+                for (uint32_t i = 0; i < md->vertices.count; ++i)
+                {
+                    v[i].position[0] = -v[i].position[0];
+                    v[i].normal[0]   = -v[i].normal[0];
+                }
+            }
+
+            // Bones: pivot + every translation/rotation keyframe in every sequence
+            if (md->bones.count)
+            {
+                const uint64_t end = uint64_t(md->bones.offset) +
+                                      uint64_t(md->bones.count) * sizeof(fmt::M2CompBone);
+                if (end > model.size()) return false;
+                for (uint32_t i = 0; i < md->bones.count; ++i)
+                {
+                    // Re-fetch the bone pointer each iteration: model.data() can move if a track
+                    // walk below ever needed to resize, though none currently do (in-place rewrite
+                    // only) -- kept defensive since this loop mutates the same buffer it reads from.
+                    auto* bone = reinterpret_cast<fmt::M2CompBone*>(
+                        model.data() + md->bones.offset + i * sizeof(fmt::M2CompBone));
+                    bone->pivot[0] = -bone->pivot[0];
+                    MirrorTranslationTrack(model, bone->translation);
+                    MirrorRotationTrack(model, bone->rotation);
+                }
+            }
+
+            // Attachments (the actual "held in hand" point, plus any particle/trail attach points)
+            if (md->attachments.count)
+            {
+                const uint64_t end = uint64_t(md->attachments.offset) +
+                                      uint64_t(md->attachments.count) * sizeof(M2AttachmentRaw);
+                if (end > model.size()) return false;
+                auto* a = reinterpret_cast<M2AttachmentRaw*>(model.data() + md->attachments.offset);
+                for (uint32_t i = 0; i < md->attachments.count; ++i)
+                    a[i].position[0] = -a[i].position[0];
+            }
+
+            // Bounding/collision volumes: min/max X swap-and-negate (a min becomes the new max and
+            // vice versa once negated), sphere/box centers unaffected by a symmetric-radius model.
+            // boundingBox/collisionBox are [minX,minY,minZ,maxX,maxY,maxZ].
+            {
+                float newMinX = -md->boundingBox[3];
+                float newMaxX = -md->boundingBox[0];
+                md->boundingBox[0] = newMinX;
+                md->boundingBox[3] = newMaxX;
+                float newCMinX = -md->collisionBox[3];
+                float newCMaxX = -md->collisionBox[0];
+                md->collisionBox[0] = newCMinX;
+                md->collisionBox[3] = newCMaxX;
+            }
+            if (md->collisionPositions.count)
+            {
+                const uint64_t end = uint64_t(md->collisionPositions.offset) +
+                                      uint64_t(md->collisionPositions.count) * sizeof(float) * 3;
+                if (end <= model.size())
+                {
+                    auto* p = reinterpret_cast<float*>(model.data() + md->collisionPositions.offset);
+                    for (uint32_t i = 0; i < md->collisionPositions.count; ++i) p[i * 3] = -p[i * 3];
+                }
+            }
+            if (md->collisionNormals.count)
+            {
+                const uint64_t end = uint64_t(md->collisionNormals.offset) +
+                                      uint64_t(md->collisionNormals.count) * sizeof(float) * 3;
+                if (end <= model.size())
+                {
+                    auto* n = reinterpret_cast<float*>(model.data() + md->collisionNormals.offset);
+                    for (uint32_t i = 0; i < md->collisionNormals.count; ++i) n[i * 3] = -n[i * 3];
+                }
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            VPathLog("  MirrorModelBytes CRASH CAUGHT '%s'", name ? name : "(null)");
+            return false;
+        }
+
+        VPathLog("  MirrorModelBytes: '%s' vertices=%u bones=%u attachments=%u", name ? name : "?",
+                 md->vertices.count, md->bones.count, md->attachments.count);
+        return true;
+    }
+
+    // Reverses triangle winding in the raw .skin file bytes: for every 3 consecutive uint16 in the
+    // triangles array, swap the last two indices. A mirror flips the sign of the transform's
+    // determinant, which flips every triangle's front/back facing under the same cull convention --
+    // this is what keeps faces from rendering inside-out after MirrorModelBytes.
+    static bool MirrorSkinWinding(const char* name, std::vector<uint8_t>& skin) noexcept
+    {
+        if (skin.size() < sizeof(M2SkinHeaderRaw)) return false;
+        auto* sh = reinterpret_cast<M2SkinHeaderRaw*>(skin.data());
+        if (std::memcmp(sh->magic, "SKIN", 4) != 0) return false;
+        if (sh->triangles.count % 3 != 0) return false;
+
+        __try
+        {
+            const uint64_t end = uint64_t(sh->triangles.offset) +
+                                  uint64_t(sh->triangles.count) * sizeof(uint16_t);
+            if (end > skin.size()) return false;
+            auto* tri = reinterpret_cast<uint16_t*>(skin.data() + sh->triangles.offset);
+            for (uint32_t t = 0; t + 2 < sh->triangles.count; t += 3)
+                std::swap(tri[t + 1], tri[t + 2]);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            VPathLog("  MirrorSkinWinding CRASH CAUGHT '%s'", name ? name : "(null)");
+            return false;
+        }
+
+        VPathLog("  MirrorSkinWinding: '%s' triangles=%u", name ? name : "?", sh->triangles.count / 3);
+        return true;
+    }
+
+    // MirrorWeaponForOffhand / VPathPopulateGlobalMirrored (auto-mirror offhand bake) removed --
+    // this client's own axis-mirror transform was crashing on equip, and the feature is no longer
+    // used: WeaponGetOffhandVirtualPath now only ever bakes an offhand model when
+    // WXLWeaponModels.csv gives it an explicit Model1OffhandPath/Model2OffhandPath (see
+    // BakeWeaponDisplayOffhand in WeaponExtension.cpp). The low-level MirrorModelBytes/
+    // MirrorSkinWinding routines above are no longer called by anything and are left in place
+    // only because other math in this file may still reference their neighbors; say the word if
+    // you want those stripped out too.
+
     // ─── Public API ───────────────────────────────────────────────────────────
 
     // Replaces the old self-registering `detail::Registrar` global above. Must be called from
@@ -1633,6 +1830,84 @@ namespace wxl::scripts::equipextension
             RegisterEvictableGroup(pool, vKey, vSkin, hasSkin);
         }
 
+        return true;
+    }
+
+    // Reads/patches byteSourcePath's bytes exactly like VPathPopulateGlobal, but derives the cache
+    // key from keySourcePath instead, and ALWAYS overwrites any existing entry under that key
+    // (unlike every other bake function here, which is "first bake wins"). Built specifically for
+    // the offhand-weapon case: this client's native weapon display resolves BOTH mainhand and
+    // offhand attach points from the SAME static ItemModelData.dbc field, so a distinctly-keyed
+    // offhand bake (see VPathPopulateGlobalMirrored) never actually gets used by native code -- the
+    // only way an offhand weapon visibly differs from mainhand is for the SHARED key mainhand
+    // already resolves through to hold the offhand's bytes instead, swapped in at the moment the
+    // offhand attach happens. Caller (WeaponExtension.cpp's BakeWeaponDisplayOffhand, from
+    // EquipExtension's per-instance offhand equip handling, never from eager startup preload) is
+    // responsible for re-asserting this swap every time, since it's inherently last-write-wins
+    // against whatever else last populated the same key.
+    bool VPathPopulateGlobalSharedKey(const char* keySourcePath, const char* byteSourcePath,
+                                      uint32_t itemDisplayId, const char* texPath,
+                                      const char* materialPatchSpec, const uint16_t* geoIds,
+                                      uint32_t geoCount, char* outVirtualPath, size_t outVirtualPathSz)
+    {
+        if (!keySourcePath || !*keySourcePath || !byteSourcePath || !*byteSourcePath) return false;
+
+        char keyNormPath[264];
+        NormalizeRealPath(keyNormPath, sizeof(keyNormPath), keySourcePath);
+        char vKey[280];
+        BuildGlobalVirtualKey(vKey, sizeof(vKey), keyNormPath, itemDisplayId);
+
+        if (outVirtualPath && outVirtualPathSz)
+        {
+            size_t n = std::strlen(vKey);
+            if (n >= outVirtualPathSz) n = outVirtualPathSz - 1;
+            std::memcpy(outVirtualPath, vKey, n);
+            outVirtualPath[n] = '\0';
+        }
+
+        char byteNormPath[264];
+        NormalizeRealPath(byteNormPath, sizeof(byteNormPath), byteSourcePath);
+
+        std::vector<uint8_t> mdxBytes;
+        if (!ReadGameFile(byteNormPath, mdxBytes))
+        {
+            VPathLog("  VPathPopulateGlobalSharedKey: mdx READ FAILED '%s' (key from '%s')",
+                     byteNormPath, keyNormPath);
+            return false;
+        }
+
+        char rSkin[264];
+        RealSkinPath(rSkin, sizeof(rSkin), byteNormPath);
+        std::vector<uint8_t> skinBytes;
+        ReadGameFile(rSkin, skinBytes); // skin may be absent; that is OK
+
+        if (geoIds && geoCount > 0)
+            ApplySkinByteFilter(skinBytes, geoIds, geoCount);
+        if (materialPatchSpec && *materialPatchSpec)
+            PatchTargetedMaterialTextures(mdxBytes, materialPatchSpec);
+        if (texPath && *texPath)
+            PatchReplaceableTextureTypes(mdxBytes, texPath);
+
+        char vSkin[280];
+        VirtualSkinPath(vSkin, sizeof(vSkin), vKey);
+
+        // operator[] assignment, not emplace: emplace is a no-op if vKey already exists, and the
+        // entire point here is to overwrite whatever's already there (almost certainly mainhand's
+        // own bake, from whenever it was last resolved).
+        g_globalOverrides[vKey] = std::move(mdxBytes);
+        if (!skinBytes.empty())
+            g_globalOverrides[vSkin] = std::move(skinBytes);
+        else
+            g_globalOverrides.erase(vSkin); // previous occupant of this key may have had a skin
+
+        // Deliberately not registered in any eviction pool: this key must never be evicted and
+        // silently regenerated from keySourcePath's own bytes by some other caller mid-session,
+        // which would quietly undo the swap without anything re-asserting it until the next equip
+        // event happens to touch this slot again.
+
+        VPathLog("  VPathPopulateGlobalSharedKey: key from '%s' bytes from '%s' (displayId=%u) -> "
+                 "vkey='%s' mdx=%zu skin=%zu",
+                 keyNormPath, byteNormPath, itemDisplayId, vKey, mdxBytes.size(), skinBytes.size());
         return true;
     }
 

@@ -35,6 +35,7 @@
 // always a generic (path, id) -> baked-bytes mechanism, not anything armor-specific. Reused as-is via
 // their current namespace, same convention CreatureExtension.cpp already follows.
 using wxl::scripts::equipextension::VPathPopulateGlobal;
+using wxl::scripts::equipextension::VPathPopulateGlobalSharedKey;
 using wxl::scripts::equipextension::VPathRegisterLazyResolver;
 using wxl::scripts::equipextension::VPathDecodeGlobalVirtualKey;
 using wxl::scripts::equipextension::WxlIniGetBool;
@@ -273,9 +274,17 @@ namespace wxl::scripts::weaponextension
     {
         std::string path[2];        // [0]=Model1Path, [1]=Model2Path; empty string = column not in use
         std::string offhandPath[2]; // [0]=Model1OffhandPath, [1]=Model2OffhandPath; empty = no
-            // offhand-specific bake for this column -- EquipExtension falls back to the mainhand
-            // bake (path[]) when this is empty, so leaving these blank changes nothing for weapons
-            // that don't need an offhand-mirrored variant.
+            // explicit hand-baked offhand model for this column -- BakeWeaponDisplayOffhand then
+            // has no offhand model at all -- auto-mirroring was removed (crashed on equip), so an
+            // explicit value here is now the only way a displayId/column gets an offhand bake.
+        bool noAutoMirror = false; // NoAutoMirror column: true suppresses the auto-mirror fallback
+            // above entirely for this displayId (offhandPath still wins if explicitly set). For
+            // items that are inherently offhand-only and never meant to be mirrored -- shields
+            // above all: a shield's Model1Path IS its offhand model already, there's no "mainhand
+            // shield" this would be mirroring FROM, and mirroring its emblem/boss/heraldry would
+            // just render it backwards for no reason. Defaults to false (auto-mirror stays on) so
+            // existing rows are unaffected; set true on any row that occupies the OffHand slot by
+            // its own nature rather than as a genuine mirrored dual-wield of a one-handed weapon.
     };
     static std::unordered_map<uint32_t, WeaponModelPaths> g_sidecarWeaponModelPath;
 
@@ -364,6 +373,9 @@ namespace wxl::scripts::weaponextension
         const int cModel2Oh = FindCsvColumn(header, "Model2OffhandPath"); // WeaponModelPaths::offhandPath
         const int cGeoset1Oh = FindCsvColumn(header, "Geoset1Offhand");   // optional -- see
         const int cGeoset2Oh = FindCsvColumn(header, "Geoset2Offhand");   // WeaponGeosetSpecs::offhandSpec
+        const int cNoAutoMirror = FindCsvColumn(header, "NoAutoMirror");  // optional -- see
+            // WeaponModelPaths::noAutoMirror. Absent column = false for every row (unchanged
+            // behavior for CSVs written before this column existed).
 
         if (cDisplay < 0 || cModel1 < 0)
         {
@@ -410,6 +422,11 @@ namespace wxl::scripts::weaponextension
                 char model2Oh[264] = {};
                 CopyString(model2Oh, sizeof(model2Oh), CsvField(row, cModel2Oh));
                 entry.offhandPath[1] = model2Oh;
+            }
+            if (cNoAutoMirror >= 0)
+            {
+                const std::string v = NormalizeCsvName(CsvField(row, cNoAutoMirror));
+                entry.noAutoMirror = (v == "true" || v == "yes" || v == "1" || v == "shield");
             }
 
             g_sidecarWeaponModelPath.emplace(displayId, std::move(entry));
@@ -537,8 +554,8 @@ namespace wxl::scripts::weaponextension
         // WxlIniGetBool's doc comment. Turning this off relies entirely on WeaponLazyResolve (see its
         // own doc comment, and its registration in the constructor below) to still bake anything at
         // all.
-        if (WxlIniGetBool("EagerPreload", "Weapons", true))
-            PreregisterSidecarWeapons();
+//        if (WxlIniGetBool("EagerPreload", "Weapons", true))
+//            PreregisterSidecarWeapons();
     }
 
     // Builds a "TextureType=TexturePath|TextureType=TexturePath|..." spec for (displayId,
@@ -650,19 +667,36 @@ namespace wxl::scripts::weaponextension
     }
 
     // Offhand counterpart to BakeWeaponDisplay. Reads WeaponModelPaths::offhandPath /
-    // WeaponGeosetSpecs::offhandSpec instead of the mainhand columns, and -- unlike
-    // BakeWeaponDisplay -- bakes unconditionally (forceBake=true) whenever an offhand path is
-    // present at all, even with no texture rows and no geoset filter: the whole point of this call
-    // is to serve a DIFFERENT real file (the caller's pre-baked mirrored model) under its own
-    // virtual name, not to patch bytes, so "nothing to patch" is not a reason to skip it the way it
-    // is for BakeWeaponDisplay's own guard. On success, caches the virtual path in
-    // g_offhandVirtualPath for WeaponGetOffhandVirtualPath to read back.
+    // WeaponGeosetSpecs::offhandSpec instead of the mainhand columns. Auto-mirroring (generating a
+    // mirrored offhand model in-memory when WXLWeaponModels.csv gives no explicit
+    // Model1OffhandPath/Model2OffhandPath) has been removed -- it was crashing on equip. Only an
+    // explicit, author-supplied OffhandPath row is ever baked now; a displayId/column with no such
+    // row simply keeps whatever the native client already attaches at the offhand point.
+    // NoAutoMirror is therefore a no-op now (nothing left to suppress) but the column is left in
+    // WeaponModelPaths/the CSV parser for now in case auto-mirroring comes back later.
     static bool BakeWeaponDisplayOffhand(uint32_t displayId, uint32_t modelColumn)
     {
         auto pathIt = g_sidecarWeaponModelPath.find(displayId);
         if (pathIt == g_sidecarWeaponModelPath.end()) return false;
-        if (modelColumn > 1 || pathIt->second.offhandPath[modelColumn].empty()) return false;
+        if (modelColumn > 1) return false;
 
+        if (pathIt->second.offhandPath[modelColumn].empty())
+        {
+            WeaponLog("  bake(offhand): display=%u column=%u no explicit OffhandPath -- "
+                      "auto-mirror removed, leaving native attach as-is", displayId, modelColumn);
+            return false;
+        }
+
+        // Per the shared-key mechanism below: only proceed if a mainhand path exists for this
+        // row to derive the shared key from -- there's nothing to safely swap into otherwise
+        // (Model1Path is a required CSV field in practice, so this mainly guards a malformed or
+        // hand-edited row).
+        if (pathIt->second.path[modelColumn].empty())
+        {
+            WeaponLog("  bake(offhand, shared-key): display=%u column=%u no mainhand path to "
+                      "derive the shared key from, skipped", displayId, modelColumn);
+            return false;
+        }
         char matSpec[2048] = {};
         BuildWeaponMaterialPatchSpec(matSpec, sizeof(matSpec), displayId, modelColumn);
 
@@ -672,18 +706,26 @@ namespace wxl::scripts::weaponextension
             geoSpec = &geoIt->second.offhandSpec[modelColumn];
 
         char vModelPath[280] = {};
-        bool registered = VPathPopulateGlobal(pathIt->second.offhandPath[modelColumn].c_str(), displayId,
-                                               nullptr, matSpec,
-                                               geoSpec ? geoSpec->ids : nullptr,
-                                               geoSpec ? geoSpec->count : 0,
-                                               true, // evictable -- rebaked lazily the same as mainhand
-                                               vModelPath, sizeof(vModelPath),
-                                               "Weapon",
-                                               true); // forceBake -- see this function's own comment
-        WeaponLog("  bake(offhand): display=%u column=%u real='%s' vpath='%s' spec='%s' geoCount=%u "
-                  "registered=%d",
-                  displayId, modelColumn, pathIt->second.offhandPath[modelColumn].c_str(), vModelPath,
-                  matSpec, geoSpec ? geoSpec->count : 0u, registered ? 1 : 0);
+        // Key derived from the MAINHAND path (pathIt->second.path[]), bytes read from the OFFHAND
+        // path (pathIt->second.offhandPath[]) -- see VPathPopulateGlobalSharedKey's doc comment.
+        // This client's native weapon display resolves both hands from the same static
+        // ItemModelData.dbc field, so a distinctly-keyed offhand bake is simply never read by
+        // native code; this is the only mechanism that actually changes what renders in the offhand
+        // slot. Deliberately re-run on every call (see WeaponGetOffhandVirtualPath) rather than
+        // cached, since anything else touching this shared key since the last call -- including
+        // another character equipping the same item in mainhand -- can have overwritten it.
+        bool registered = VPathPopulateGlobalSharedKey(
+            pathIt->second.path[modelColumn].c_str(),
+            pathIt->second.offhandPath[modelColumn].c_str(),
+            displayId, nullptr, matSpec,
+            geoSpec ? geoSpec->ids : nullptr,
+            geoSpec ? geoSpec->count : 0,
+            vModelPath, sizeof(vModelPath));
+        WeaponLog("  bake(offhand, shared-key): display=%u column=%u keyFrom='%s' bytesFrom='%s' "
+                  "vpath='%s' spec='%s' geoCount=%u registered=%d",
+                  displayId, modelColumn, pathIt->second.path[modelColumn].c_str(),
+                  pathIt->second.offhandPath[modelColumn].c_str(), vModelPath, matSpec,
+                  geoSpec ? geoSpec->count : 0u, registered ? 1 : 0);
 
         if (registered && vModelPath[0])
         {
@@ -698,16 +740,37 @@ namespace wxl::scripts::weaponextension
         if (!out || outSz == 0 || column > 1) return false;
         LoadWeaponSidecar(); // no-op after the first call; guards against this being called before
                               // WeaponExtension's own OnModelLoadPre has ever fired
-        auto it = g_offhandVirtualPath.find(OffhandCacheKey(displayId, column));
-        if (it == g_offhandVirtualPath.end())
+
+        // Two different caching rules depending on which branch of BakeWeaponDisplayOffhand this
+        // displayId/column actually uses: an explicit WXLWeaponModels.csv OffhandPath bakes into a
+        // key SHARED with the mainhand bake (see VPathPopulateGlobalSharedKey's own doc comment for
+        // why), which anything else touching that same key can silently overwrite in between calls
+        // -- so that case must re-assert the swap on every single call, never trusting a cached
+        // "already baked" result. An auto-mirrored offhand (no explicit OffhandPath) bakes into its
+        // own distinct, never-shared key instead, so the existing bake-once-and-cache behavior is
+        // both correct and worth keeping for that case.
+        auto pathIt = g_sidecarWeaponModelPath.find(displayId);
+        const bool isSharedKey = pathIt != g_sidecarWeaponModelPath.end() && column < 2 &&
+                                  !pathIt->second.offhandPath[column].empty();
+
+        if (isSharedKey)
         {
-            // Not baked yet -- either [EagerPreload] Weapons is off, or this is a rare timing case
-            // eager preload missed. Try baking it now, on the spot, same fallback role
-            // WeaponLazyResolve plays for the mainhand columns.
             if (!BakeWeaponDisplayOffhand(displayId, column)) return false;
-            it = g_offhandVirtualPath.find(OffhandCacheKey(displayId, column));
-            if (it == g_offhandVirtualPath.end()) return false;
         }
+        else
+        {
+            // No explicit OffhandPath for this displayId/column -- with auto-mirroring removed,
+            // BakeWeaponDisplayOffhand always fails here now, so this call can only ever serve an
+            // already-cached entry from a run before auto-mirroring was removed. Left in place
+            // (rather than special-cased away) so a stale cache entry still reads back correctly
+            // if one happens to exist; a fresh install/session simply won't have one.
+            if (!BakeWeaponDisplayOffhand(displayId, column) &&
+                g_offhandVirtualPath.find(OffhandCacheKey(displayId, column)) == g_offhandVirtualPath.end())
+                return false;
+        }
+
+        auto it = g_offhandVirtualPath.find(OffhandCacheKey(displayId, column));
+        if (it == g_offhandVirtualPath.end()) return false;
         if (it->second.size() >= outSz) return false;
         std::memcpy(out, it->second.c_str(), it->second.size() + 1);
         return true;
@@ -736,20 +799,25 @@ namespace wxl::scripts::weaponextension
                   g_sidecarWeaponModelPath.size(), g_sidecarWeaponTextures.size());
 
         uint32_t registeredCount = 0;
-        uint32_t offhandRegisteredCount = 0;
         for (const auto& [displayId, paths] : g_sidecarWeaponModelPath)
         {
             for (uint32_t col = 0; col < 2; ++col)
             {
                 if (paths.path[col].empty()) continue;
                 if (BakeWeaponDisplay(displayId, col)) ++registeredCount;
-                if (!paths.offhandPath[col].empty() && BakeWeaponDisplayOffhand(displayId, col))
-                    ++offhandRegisteredCount;
+                // Deliberately NOT eager-baking offhand here, for either branch of
+                // BakeWeaponDisplayOffhand: the explicit/shared-key case would permanently
+                // overwrite the mainhand's own shared cache key before any character has equipped
+                // anything at all (see VPathPopulateGlobalSharedKey's doc comment), and the
+                // auto-mirror case, while safe to eager-bake in principle (distinct key), isn't
+                // worth the startup cost for weapons that may never actually be dual-wielded.
+                // WeaponGetOffhandVirtualPath's self-heal branch bakes both lazily, on the first
+                // actual offhand equip that needs them.
             }
         }
 
         WeaponLog("weapon preregister: done, %u display/column combo(s) registered ahead of first "
-                  "equip, %u offhand-mirror combo(s) registered", registeredCount, offhandRegisteredCount);
+                  "equip", registeredCount);
     }
 
     // Lazy on-demand counterpart to PreregisterSidecarWeapons, registered with VirtualPath.cpp via

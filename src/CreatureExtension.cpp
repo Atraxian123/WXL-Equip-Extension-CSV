@@ -451,8 +451,8 @@ namespace wxl::scripts::creatureextension
         // its own doc comment, and its registration in the constructor below) to still bake anything
         // at all -- unlike weapons, there is no separate reactive per-equip hook for creature models
         // to fall back on.
-        if (WxlIniGetBool("EagerPreload", "Creatures", true))
-            PreregisterSidecarCreatures();
+//        if (WxlIniGetBool("EagerPreload", "Creatures", true))
+//            PreregisterSidecarCreatures();
     }
 
     // Builds a "TextureType=TexturePath|TextureType=TexturePath|..." spec for displayId, in the

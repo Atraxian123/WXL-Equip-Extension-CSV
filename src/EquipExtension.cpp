@@ -20,7 +20,6 @@
 #include "WxlOffsets.hpp"
 #include "VirtualPath.hpp"
 #include "common/Log.hpp"
-#include "engine/assets/shared/common/Text.hpp"
 #include "engine/events/Event.hpp"
 #include "game/Binding.hpp"
 #include "game/Io.hpp"
@@ -1050,7 +1049,7 @@ r.count = static_cast<uint16_t>(collN);
     static uint32_t InferObjectComponentAttach(const char* name, bool isCollection,
                                                bool explicitAttach,
                                                uint32_t attach) noexcept
- {
+    {
         if (explicitAttach || isCollection) return attach;
         if (ContainsCI(name, "lshoulder_") || ContainsCI(name, "_shoulder_l")) return 6;
         if (ContainsCI(name, "rshoulder_") || ContainsCI(name, "_shoulder_r")) return 5;
@@ -1075,25 +1074,6 @@ r.count = static_cast<uint16_t>(collN);
         if (ContainsCI(name, "tabard_")) return 34;
         return attach;
     }
-//    {
-//        if (explicitAttach || isCollection) return attach;
-//        // Broadened from requiring a leading underscore (_shoulder_l/_shoulder_r) or the specific
-//        // lshoulder_/rshoulder_ prefix: a plain "shoulder_l.mdx"/"shoulder_r.mdx" -- "shoulder"
-//        // with no leading token at all -- previously matched none of those and fell through
-//        // without an inferred attach point. Just checking for "shoulder_l"/"shoulder_r" anywhere
-//        // in the name covers all of the above plus this case, without narrowing anything.
-//        if (StartsWithCI(name, "lshoulder_") || ContainsCI(name, "shoulder_l")) return 6;
-//        if (StartsWithCI(name, "rshoulder_") || ContainsCI(name, "shoulder_r")) return 5;
-//        if (StartsWithCI(name, "collections_"))
-//        {
-//            if (ContainsCI(name, "shoulder_l")) return 6;
-//            if (ContainsCI(name, "shoulder_r")) return 5;
-//            if (StartsWithCI(name, "collections_belt_") || ContainsCI(name, "_belt")) return 53;
-//        }
-//        if (StartsWithCI(name, "cape_")) return 12;
-//        if (StartsWithCI(name, "tabard_")) return 34;
-//        return attach;
-//    }
 
     static bool SlotAllowsNormalObjectModel(uint32_t modelSlot) noexcept
     {
@@ -2019,10 +1999,17 @@ r.count = static_cast<uint16_t>(collN);
 
     // Offhand weapon-mirror override. This client has no native offhand model mirroring (a weapon
     // dual-wielded in the offhand renders identically to mainhand, backwards-looking blade/hilt and
-    // all), so instead of runtime geometry mirroring -- which would also need every vertex, normal,
-    // triangle winding, bone pivot, translation/rotation keyframe across every animation sequence,
-    // and attachment point re-derived correctly, a large and failure-prone undertaking -- this
-    // swaps in a separately, correctly pre-baked mirrored model, authored and supplied externally
+    // all). Two mirror sources, in priority order:
+    //   1. WXLWeaponModels.csv's Model1OffhandPath/Model2OffhandPath/Geoset1Offhand/Geoset2Offhand
+    //      -- a correctly pre-baked mirrored model, authored and supplied externally. Always wins
+    //      when present (e.g. for a weapon whose hilt/engraving detail an automatic mirror gets
+    //      visibly wrong).
+    //   2. Otherwise, WeaponExtension.cpp's BakeWeaponDisplayOffhand auto-mirrors the mainhand
+    //      model on the spot (VirtualPath.cpp's MirrorWeaponForOffhand: every vertex, normal,
+    //      triangle winding, bone pivot, and translation/rotation keyframe across every animation
+    //      sequence, plus attachment point offsets), so an offhand weapon is never left unmirrored
+    //      by default.
+    // Either way, WeaponGetOffhandVirtualPath is the single entry point this function calls --
     // (WXLWeaponModels.csv's Model1OffhandPath/Model2OffhandPath/Geoset1Offhand/Geoset2Offhand).
     //
     // ASSUMPTION FLAGGED FOR VERIFICATION: attach IDs 0 (mainhand/ITEM_VISUAL0) and 1
@@ -2037,13 +2024,25 @@ r.count = static_cast<uint16_t>(collN);
 
     static void HandleOffhandWeaponOverride(void* cmo, void* subObj, uint32_t displayId)
     {
-        if (!subObj || displayId == 0) return; // unequip: nothing to override, native detach handles it
+        EquipLog("  HandleOffhandWeaponOverride: entered cmo=0x%p subObj=0x%p displayId=%u",
+                 cmo, subObj, displayId);
+
+        if (!subObj || displayId == 0)
+        {
+            EquipLog("  HandleOffhandWeaponOverride: bailing, subObj=0x%p displayId=%u", subObj, displayId);
+            return; // unequip: nothing to override, native detach handles it
+        }
 
         char vPath[2][280] = {};
         const bool has0 = wxl::scripts::weaponextension::WeaponGetOffhandVirtualPath(displayId, 0, vPath[0], sizeof(vPath[0]));
         const bool has1 = wxl::scripts::weaponextension::WeaponGetOffhandVirtualPath(displayId, 1, vPath[1], sizeof(vPath[1]));
-        if (!has0 && !has1) return; // no offhand-mirror configured for this weapon -- leave native
-                                     // vanilla attach (the mainhand bake) exactly as it already is
+        if (!has0 && !has1)
+        {
+            EquipLog("  HandleOffhandWeaponOverride: no mirror for displayId=%u (has0=0 has1=0) -- "
+                      "leaving native attach as-is", displayId);
+            return; // no offhand-mirror configured for this weapon -- leave native vanilla attach
+                     // (the mainhand bake) exactly as it already is
+        }
 
         EquipLog("  HandleOffhandWeaponOverride: displayId=%u col0='%s' col1='%s'",
                  displayId, has0 ? vPath[0] : "(none)", has1 ? vPath[1] : "(none)");
