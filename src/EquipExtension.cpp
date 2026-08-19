@@ -24,6 +24,7 @@
 #include "game/Binding.hpp"
 #include "game/Io.hpp"
 #include "game/M2.hpp"
+#include "offsets/game/M2.hpp"
 #include "game/Unit.hpp"
 
 #include <windows.h>
@@ -2024,25 +2025,13 @@ r.count = static_cast<uint16_t>(collN);
 
     static void HandleOffhandWeaponOverride(void* cmo, void* subObj, uint32_t displayId)
     {
-        EquipLog("  HandleOffhandWeaponOverride: entered cmo=0x%p subObj=0x%p displayId=%u",
-                 cmo, subObj, displayId);
-
-        if (!subObj || displayId == 0)
-        {
-            EquipLog("  HandleOffhandWeaponOverride: bailing, subObj=0x%p displayId=%u", subObj, displayId);
-            return; // unequip: nothing to override, native detach handles it
-        }
+        if (!subObj || displayId == 0) return; // unequip: nothing to override, native detach handles it
 
         char vPath[2][280] = {};
         const bool has0 = wxl::scripts::weaponextension::WeaponGetOffhandVirtualPath(displayId, 0, vPath[0], sizeof(vPath[0]));
         const bool has1 = wxl::scripts::weaponextension::WeaponGetOffhandVirtualPath(displayId, 1, vPath[1], sizeof(vPath[1]));
-        if (!has0 && !has1)
-        {
-            EquipLog("  HandleOffhandWeaponOverride: no mirror for displayId=%u (has0=0 has1=0) -- "
-                      "leaving native attach as-is", displayId);
-            return; // no offhand-mirror configured for this weapon -- leave native vanilla attach
-                     // (the mainhand bake) exactly as it already is
-        }
+        if (!has0 && !has1) return; // no offhand-mirror configured for this weapon -- leave native
+                                     // vanilla attach (the mainhand bake) exactly as it already is
 
         EquipLog("  HandleOffhandWeaponOverride: displayId=%u col0='%s' col1='%s'",
                  displayId, has0 ? vPath[0] : "(none)", has1 ? vPath[1] : "(none)");
@@ -3052,6 +3041,66 @@ r.count = static_cast<uint16_t>(collN);
     {
     offsets::m2hooks::PerFrameUpdateFn   g_origM2PerFrame       = nullptr;
     offsets::m2hooks::BuildBonePaletteFn g_origBuildBonePalette = nullptr;
+
+    // DIAGNOSTIC ONLY -- signature genuinely unknown. Core's own offset table documents only the
+    // address and calling convention: "Take over weapon and off-hand model placement, including its
+    // sheathe behaviour. __cdecl, caller-cleaned." (wxl::offsets::game::m2::kCharAddHandItem). Built
+    // to find whether/which argument distinguishes mainhand from offhand at the point the native
+    // client resolves this, as an alternative to the shared-virtual-key mechanism in
+    // WeaponExtension.cpp, which has a known cross-character cache-poisoning risk that a real
+    // attach-point-aware hook here could avoid entirely.
+    //
+    // Over-declaring 8 uint32_t stack args is safe for __cdecl regardless of the real count: on
+    // entry, any slots beyond the real arguments just read into the *caller's* own stack frame
+    // (a safe read, garbage values, never written to). On call-through, the original function's own
+    // compiled code only ever reads however many args IT was built to expect -- it silently ignores
+    // whatever extra values sit further up the stack, since it never has a reason to look there.
+    // Only the final call-through's return value matters for correctness here (EAX passes through
+    // to the real caller by being the last thing this function does, with nothing after it to
+    // clobber the register) -- no return type is modeled, since it's unknown and this only needs to
+    // be transparent, not to consume the result itself.
+    using CharAddHandItemFn = void(__cdecl*)(uint32_t, uint32_t, uint32_t, uint32_t,
+                                              uint32_t, uint32_t, uint32_t, uint32_t);
+    CharAddHandItemFn g_origCharAddHandItem = nullptr;
+
+    void __cdecl CharAddHandItemDetour(uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+                                       uint32_t a4, uint32_t a5, uint32_t a6, uint32_t a7)
+    {
+        const uint32_t args[8] = { a0, a1, a2, a3, a4, a5, a6, a7 };
+        EquipLog("  kCharAddHandItem CALL: a0=0x%08X a1=0x%08X a2=0x%08X a3=0x%08X "
+                 "a4=0x%08X a5=0x%08X a6=0x%08X a7=0x%08X", a0, a1, a2, a3, a4, a5, a6, a7);
+        for (int i = 0; i < 8; ++i)
+        {
+            if (args[i] <= 0x10000 || args[i] >= 0x7fffffffu) continue; // not a plausible pointer
+            __try
+            {
+//                const uint32_t* asStr = reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(args[i]));
+//                if (*asStr && std::strlen(asStr) < 128)
+//                {
+//                    EquipLog("    a%d as string: %08X", i, asStr);
+//                }
+
+//                const char* asStr = reinterpret_cast<const char*>(static_cast<uintptr_t>(args[i]));
+//                if (*asStr && std::strlen(asStr) < 128)
+//                {
+//                    EquipLog("    a%d as string: '%s'", i, asStr);
+//                }
+//                else
+//                {
+                    const uint32_t* asPtr =
+                        reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(args[i]));
+                    EquipLog("    a%d as ptr: [0]=0x%08X [1]=0x%08X [2]=0x%08X [3]=0x%08X",
+                             i, asPtr[0], asPtr[1], asPtr[2], asPtr[3]);
+//                }
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                EquipLog("    a%d not a valid pointer", i);
+            }
+        }
+        if (g_origCharAddHandItem)
+            g_origCharAddHandItem(a0, a1, a2, a3, a4, a5, a6, a7);
+    }
     }
 
     // Defined directly in wxl::scripts::equipextension (NOT in the anonymous namespace above) so
@@ -3093,6 +3142,14 @@ r.count = static_cast<uint16_t>(collN);
                               offsets::m2hooks::kBuildBonePalette,
                               reinterpret_cast<void*>(&BuildBonePaletteDetour),
                               reinterpret_cast<void**>(&g_origBuildBonePalette),
+                              WXL_HOOK_DEFAULT_PRIORITY) != 0;
+        // DIAGNOSTIC ONLY -- see CharAddHandItemDetour's own comment. Address is core's own
+        // wxl::offsets::game::m2::kCharAddHandItem, not the extension-local offsets::m2hooks table
+        // the two hooks above use.
+        ok &= api->HookAttach("wxl-equip-extension:CharAddHandItem",
+                              wxl::offsets::game::m2::kCharAddHandItem,
+                              reinterpret_cast<void*>(&CharAddHandItemDetour),
+                              reinterpret_cast<void**>(&g_origCharAddHandItem),
                               WXL_HOOK_DEFAULT_PRIORITY) != 0;
         if (!ok)
             api->Log(WXL_LOG_ERROR, "equip-extension", "M2Render: one or more hooks failed");
