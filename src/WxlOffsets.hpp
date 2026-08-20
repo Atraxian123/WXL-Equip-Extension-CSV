@@ -82,8 +82,13 @@ namespace wxl::scripts::equipextension::offsets
         constexpr uintptr_t kStorageObject = 0x00AD3DDC; // storage instance
         // sub_4cfd90: thiscall(ecx=storageObj, displayId, outBuf); fills outBuf with the 256-byte
         // record copy (field pointers point into the live DBC string block); returns non-zero if
-        // found. Called directly (not detoured) -- this is the client's own already-mapped code,
-        // same category as an SDK facade reading the fixed-base image, not a hook target.
+        // found. Historically called directly (not detoured) by WeaponExtension.cpp's own code --
+        // that usage is unaffected. Also now attached as a TEMPORARY diagnostic hook via
+        // api->HookAttachByName("Db2.ItemDisplayInfoLookup", ...) in EquipExtension.cpp
+        // (ItemDisplayInfoLookupDetour), to investigate whether/when this fires for weapon slots --
+        // see that function's doc comment. kLookup itself is unused by that hook (HookAttachByName
+        // resolves the address by name, not from this constant); it's kept here only for the
+        // existing direct-call use and kStorageObject below.
         constexpr uintptr_t kLookup = 0x004CFD90;
         using LookupFn = uint32_t(__fastcall*)(void* storageObj, void* edx, uint32_t displayId, void* outBuf);
 

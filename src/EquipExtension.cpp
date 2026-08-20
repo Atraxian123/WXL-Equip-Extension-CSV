@@ -28,6 +28,7 @@
 #include "game/Unit.hpp"
 
 #include <windows.h>
+#include <intrin.h> // _ReturnAddress() -- used by the diagnostic hooks below
 
 #include <cstddef>
 #include <cstdio>
@@ -209,6 +210,17 @@ static EquipExtension* g_equipInstance = nullptr; // set in the constructor, use
         17,                      // 17 RANGED
         10,                      // 18 TABARD
     };
+
+    // ─── Diagnostic call-order sequence (temporary -- weapon mainhand/offhand investigation) ─────
+    // Shared by OnItemSlotChange/OnItemSlotClear and the diagnostic hooks below (ItemDisplayInfo-
+    // LookupDetour, CharAddHandItemDetour) so their WarcraftXL_equip.log lines can be sorted back
+    // into true call order even when GetTickCount()'s ~15ms resolution can't tell two calls apart.
+    // InterlockedIncrement rather than a plain ++ since detours can in principle run off the main
+    // thread (loader/streaming threads touch some of these paths) and this counter must never hand
+    // out the same value twice. Remove alongside the diagnostic hooks once the investigation is
+    // done -- a normal build has no use for this.
+    static LONG g_diagSeq = 0;
+    static uint32_t NextDiagSeq() noexcept { return static_cast<uint32_t>(InterlockedIncrement(&g_diagSeq)); }
 
     // ─── Debug logging ───────────────────────────────────────────────────────────
 
@@ -2060,6 +2072,18 @@ r.count = static_cast<uint16_t>(collN);
 
     void EquipExtension::OnItemSlotChange(const ev::ItemSlotChangeArgs& a)
     {
+        // DIAG (temporary -- weapon mainhand/offhand investigation): logged unconditionally, before
+        // any of this function's existing branches/early-returns, specifically because the
+        // modelSlot >= 14 cutoff further down means slots 15 (MainHand) and 17 (Ranged) currently
+        // produce NO log output at all past this point -- only 16 (OffHand) reaches the "---
+        // OnItemSlotChange" line below, via HandleOffhandWeaponOverride's own EquipLog calls. If
+        // this line never appears for a mainhand/ranged equip, that's proof this event doesn't fire
+        // for that slot at all (supporting the CharAddHandItem-instead-of-CharModelSlotDispatch
+        // theory); if it DOES appear, the event fires but this function's own early-return is why
+        // nothing further gets logged for those two slots today.
+        EquipLog("[DIAG seq=%u tick=%u] OnItemSlotChange ENTRY cmo=0x%p slot=%u itemDataPtr=0x%p",
+                 NextDiagSeq(), GetTickCount(), a.charModelObj, a.modelSlot, a.itemDataPtr);
+
         if (a.modelSlot == 16) // OffHand -- see HandleOffhandWeaponOverride's own comment. Handled
                                 // separately from, and before, the armor-only cutoff just below:
                                 // a weapon slot has exactly one attach point and none of the
@@ -2452,6 +2476,12 @@ r.count = static_cast<uint16_t>(collN);
 
     void EquipExtension::OnItemSlotClear(const ev::ItemSlotClearArgs& a)
     {
+        // DIAG (temporary -- weapon mainhand/offhand investigation): see OnItemSlotChange's
+        // matching comment. equipSlotWow here is the WoW slot index directly (15/16/17 for
+        // weapons), not yet translated through kEquipToModelSlot.
+        EquipLog("[DIAG seq=%u tick=%u] OnItemSlotClear ENTRY cmo=0x%p equipSlotWow=%u",
+                 NextDiagSeq(), GetTickCount(), a.charModelObj, a.equipSlotWow);
+
         if (a.equipSlotWow >= 19) return;
         uint32_t modelSlot = kEquipToModelSlot[a.equipSlotWow];
         if (modelSlot == static_cast<uint32_t>(-1)) return;
@@ -3063,12 +3093,62 @@ r.count = static_cast<uint16_t>(collN);
                                               uint32_t, uint32_t, uint32_t, uint32_t);
     CharAddHandItemFn g_origCharAddHandItem = nullptr;
 
+    // WOW EQUIPMENT_SLOT_* values as seen on a2 -- confirmed empirically, see the offhand-mirror
+    // investigation notes (a2 tracks MainHand(15)/OffHand(16)/Ranged(17) exactly, across every
+    // logged equip event). All three are now wired through this same override point -- see the
+    // call site's own comment for why -- unifying what used to be two separate mechanisms (a
+    // static ItemModelData.dbc patch for mainhand/ranged, a runtime hook for offhand only) into
+    // one.
+    constexpr uint32_t kEquipSlotMainHand = 15;
+    constexpr uint32_t kEquipSlotOffHand  = 16;
+    constexpr uint32_t kEquipSlotRanged   = 17;
+
+    // Return address(es) identifying an ItemDisplayInfoLookup call site that's a real weapon
+    // mainhand/offhand dispatch path -- confirmed empirically (see the offhand-mirror investigation
+    // notes): fires once per hand immediately before CharAddHandItem, with this call's outBuf being
+    // the exact same pointer CharAddHandItem receives as its a1.
+    //
+    // TWO distinct sites are known, not one: 0x006DC800 is the in-world equip path (the original
+    // investigation); 0x004E3F90 is a SEPARATE dispatch site the char-select/glue-scene preview
+    // character resolves weapons through instead -- confirmed from a char-select capture showing
+    // the identical outBuf/a1 pointer-identity relationship, just reached via that other retAddr.
+    // Both call sites carry the exact same (displayId in, resolved-record out) contract as far as
+    // this stash cares, so both are accepted; without 0x004E3F90 here, char-select's dispatch calls
+    // never get stashed, CharAddHandItemDetour always misses for them, and the char-select preview
+    // silently keeps whatever Model1 the native lookup resolved (the mainhand model, for both
+    // hands) instead of ever reaching the offhand override.
+    //
+    // The two known non-dispatch sites (0x00759077 sheathe-visual resolve, 0x0059800B paperdoll
+    // polling) are still deliberately NOT stashed, so they can never be mistaken for a dispatch
+    // call downstream. If a THIRD scene (e.g. some other preview/mirror path) turns out to reach
+    // CharAddHandItem through yet another retAddr, the fix is the same shape: add it here.
+    constexpr uintptr_t kWeaponDispatchRetAddrs[] = { 0x006DC800, 0x004E3F90 };
+
+    bool IsWeaponDispatchRetAddr(void* returnAddr) noexcept
+    {
+        const uintptr_t addr = reinterpret_cast<uintptr_t>(returnAddr);
+        for (uintptr_t known : kWeaponDispatchRetAddrs)
+            if (addr == known) return true;
+        return false;
+    }
+
+    // outBuf -> displayId stash, populated by ItemDisplayInfoLookupDetour (below) for
+    // kWeaponDispatchRetAddrs calls only, consumed (and erased) by CharAddHandItemDetour to recover
+    // which displayId its a1 belongs to -- a1 itself carries no displayId, only the already-
+    // resolved record. Erased on consumption rather than left to expire naturally: outBuf is a
+    // caller stack address, so it WILL get reused by an unrelated later call, and a stale entry
+    // could otherwise mis-attribute that later a1 to this displayId. Declared here, ahead of both
+    // functions that touch it, so declaration order doesn't matter for either.
+    std::unordered_map<void*, uint32_t> g_weaponDispatchOutBufDisplayId;
+
     void __cdecl CharAddHandItemDetour(uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
                                        uint32_t a4, uint32_t a5, uint32_t a6, uint32_t a7)
     {
+        const uint32_t seq = NextDiagSeq();
         const uint32_t args[8] = { a0, a1, a2, a3, a4, a5, a6, a7 };
-        EquipLog("  kCharAddHandItem CALL: a0=0x%08X a1=0x%08X a2=0x%08X a3=0x%08X "
-                 "a4=0x%08X a5=0x%08X a6=0x%08X a7=0x%08X", a0, a1, a2, a3, a4, a5, a6, a7);
+        EquipLog("[DIAG seq=%u tick=%u] kCharAddHandItem CALL: a0=0x%08X a1=0x%08X a2=0x%08X "
+                 "a3=0x%08X a4=0x%08X a5=0x%08X a6=0x%08X a7=0x%08X",
+                 seq, GetTickCount(), a0, a1, a2, a3, a4, a5, a6, a7);
         for (int i = 0; i < 8; ++i)
         {
             if (args[i] <= 0x10000 || args[i] >= 0x7fffffffu) continue; // not a plausible pointer
@@ -3098,8 +3178,184 @@ r.count = static_cast<uint16_t>(collN);
                 EquipLog("    a%d not a valid pointer", i);
             }
         }
+
+        // Weapon model-variant override, unified across all three weapon slots -- see this file's
+        // top-of-investigation notes and kEquipSlotMainHand's own doc comment. a1 is the resolved
+        // ItemDisplayInfo record (the same outBuf ItemDisplayInfoLookupDetour stashed a displayId
+        // for, at the dispatch call site only); a2 is the WOW equip-slot index.
+        if (a2 == kEquipSlotMainHand || a2 == kEquipSlotOffHand || a2 == kEquipSlotRanged)
+        {
+            void* outBuf = reinterpret_cast<void*>(static_cast<uintptr_t>(a1));
+            auto stashIt = g_weaponDispatchOutBufDisplayId.find(outBuf);
+            if (stashIt != g_weaponDispatchOutBufDisplayId.end())
+            {
+                const uint32_t displayId = stashIt->second;
+                g_weaponDispatchOutBufDisplayId.erase(stashIt); // one-shot -- see stash doc comment
+
+                // Column 0 == Model1/Model1Path -- the only column CharAddHandItem's a1 record
+                // needs overridden here, on any of the three slots (see the doc comments on
+                // WeaponGetVirtualPath/WeaponGetOffhandVirtualPath for why Model2 never needs this
+                // treatment). Persists across calls (not stack-local) since a1's Model1 field is
+                // left pointing at it after this function returns, and the native call-through
+                // below reads it back out of a1 synchronously -- a per-call local would be
+                // dangling before that read happens. Separate buffers per slot-kind so a mainhand
+                // and an offhand override landing back-to-back (e.g. two different weapons equipped
+                // in the same tick) can never clobber each other's still-pending string.
+                static char s_mainhandVirtualPath[280];
+                static char s_offhandVirtualPath[280];
+
+                // Offhand keeps its original, narrower behavior: ONLY override Model1 when the
+                // sidecar has an explicit offhand model configured for this displayId
+                // (WXLWeaponModels.csv's Model1OffhandPath) -- WeaponGetOffhandVirtualPath already
+                // encodes exactly that condition, so no separate check is needed here. Mainhand and
+                // ranged use the ordinary mainhand bake instead (WeaponGetVirtualPath), which mirrors
+                // whatever ItemModelData.dbc's own Model1 patch already names for a baked entry.
+                const bool isOffhand = (a2 == kEquipSlotOffHand);
+                const bool overridden = isOffhand
+                    ? wxl::scripts::weaponextension::WeaponGetOffhandVirtualPath(
+                          displayId, 0, s_offhandVirtualPath, sizeof(s_offhandVirtualPath))
+                    : wxl::scripts::weaponextension::WeaponGetVirtualPath(
+                          displayId, 0, s_mainhandVirtualPath, sizeof(s_mainhandVirtualPath));
+                char* const vpath = isOffhand ? s_offhandVirtualPath : s_mainhandVirtualPath;
+
+                // BUG FIX (missing-model cubes on both hands): WeaponGetVirtualPath/
+                // WeaponGetOffhandVirtualPath return the FULL directory-qualified vkey --
+                // "item\objectcomponents\weapon\...m2" -- because that's the string
+                // ItemModelData.dbc's own Model1/Model2 field needs (see BakeWeaponDisplay's doc
+                // comment). But the record CharAddHandItem's a1 comes from is ItemDisplayInfo, not
+                // ItemModelData -- and per every logged native lookup, ItemDisplayInfo::Model1 is
+                // always a BARE FILENAME with no directory at all (e.g.
+                // 'glaive_1h_blackdragonoutdoor_d_01_R_71029.mdx') -- the client prepends
+                // "Item\ObjectComponents\Weapon\" itself when it turns that field into an actual
+                // file request. Writing the full vkey here made the client double the prefix
+                // (VirtualProvide's own MISS log showed the literal doubled path), so the request
+                // never matched the single-prefixed key VPathPopulateGlobal actually registered --
+                // hence cubes on both hands, since both wrote the same over-qualified string.
+                // Fix: reduce vpath to its filename component (last path separator onward) before
+                // handing it to the native record -- points into the same persistent buffer, so no
+                // extra copy or lifetime concern.
+                char* vpathFilename = vpath;
+                if (overridden)
+                {
+                    for (char* p = vpath; *p; ++p)
+                        if (*p == '\\' || *p == '/')
+                            vpathFilename = p + 1;
+                }
+
+                if (overridden)
+                {
+                    __try
+                    {
+                        auto* base = reinterpret_cast<uint8_t*>(outBuf);
+                        *reinterpret_cast<char**>(base + offsets::itemdisplayinfo::kOffModel1) =
+                            vpathFilename;
+                        EquipLog("[DIAG seq=%u] kCharAddHandItem: %s override applied, "
+                                 "displayId=%u slot=%u Model1<-'%s' (full vkey='%s')", seq,
+                                 isOffhand ? "offhand" : "mainhand/ranged", displayId, a2,
+                                 vpathFilename, vpath);
+                    }
+                    __except (EXCEPTION_EXECUTE_HANDLER)
+                    {
+                        EquipLog("[DIAG seq=%u] kCharAddHandItem: %s override write faulted, "
+                                 "displayId=%u a1=0x%08X", seq,
+                                 isOffhand ? "offhand" : "mainhand/ranged", displayId, a1);
+                    }
+                }
+                else
+                {
+                    // Offhand: no sidecar Model1OffhandPath for this displayId -- per spec, skip
+                    // the bake and leave Model1 as ItemModelData.dbc already resolved it.
+                    // Mainhand/ranged: nothing to bake (no texture row/geoset filter) -- same
+                    // outcome, leave the already-resolved record untouched.
+                    EquipLog("[DIAG seq=%u] kCharAddHandItem: no sidecar %s model for displayId=%u, "
+                             "leaving Model1 as-is", seq, isOffhand ? "offhand" : "mainhand/ranged",
+                             displayId);
+                }
+            }
+            else
+            {
+                EquipLog("[DIAG seq=%u] kCharAddHandItem: slot=%u but no stashed displayId "
+                         "for a1=0x%08X (outBuf not from the expected dispatch lookup?)", seq, a2, a1);
+            }
+        }
+
         if (g_origCharAddHandItem)
             g_origCharAddHandItem(a0, a1, a2, a3, a4, a5, a6, a7);
+        EquipLog("[DIAG seq=%u] kCharAddHandItem RETURN", seq);
+    }
+
+    // DIAGNOSTIC ONLY -- answers three open questions from the weapon mainhand/offhand
+    // investigation:
+    //   1. Does Db2.ItemDisplayInfoLookup fire at all for a weapon equip, given
+    //      OnItemSlotChange apparently doesn't (see its own DIAG comment)?
+    //   2. Where does it land, in call order, relative to OnItemSlotChange/OnItemSlotClear and
+    //      CharAddHandItem -- before, after, nested inside one of them, or on a separate thread
+    //      entirely? g_diagSeq (shared with all four) and the logged return address answer this
+    //      without needing a debugger attached.
+    //   3. Does the (displayId, outBuf) shape carry anything that distinguishes mainhand from
+    //      offhand? Per the signature, the answer is almost certainly no -- there is no slot
+    //      parameter at all, only displayId in and a record out -- but this logs the actual
+    //      resolved Model1/Model2/Tex1/Tex2 strings per call so that's confirmed empirically
+    //      rather than assumed from the signature alone.
+    //
+    // Remove once these are answered: this is a per-lookup hook on a path every equipped item
+    // (armor included, not just weapons) resolves through, so it is far too hot to leave in a
+    // normal build.
+    offsets::itemdisplayinfo::LookupFn g_origItemDisplayLookup = nullptr;
+
+    uint32_t __fastcall ItemDisplayInfoLookupDetour(void* storageObj, void* edx, uint32_t displayId, void* outBuf)
+    {
+        const uint32_t seq  = NextDiagSeq();
+        const DWORD    tick = GetTickCount();
+        // Return address of the call instruction that reached this detour -- lets log lines be
+        // bucketed by caller (CharModelSlotDispatch vs CharAddHandItem vs anything else) even
+        // without a debugger: compare this value against known function-body address ranges
+        // afterward (it points just past the call site, inside whichever function issued it, not
+        // at that function's own entry point, so it needs a disassembly listing to resolve to a
+        // name -- it's still enough to tell two different callers apart from each other).
+        void* returnAddr = _ReturnAddress();
+
+        EquipLog("[DIAG seq=%u tick=%u] ItemDisplayInfoLookup CALL: displayId=%u storageObj=0x%p "
+                 "outBuf=0x%p retAddr=0x%p", seq, tick, displayId, storageObj, outBuf, returnAddr);
+
+        const uint32_t result = g_origItemDisplayLookup
+            ? g_origItemDisplayLookup(storageObj, edx, displayId, outBuf)
+            : 0;
+
+        // Stash for CharAddHandItemDetour -- see kWeaponDispatchRetAddrs' own doc comment. Only a
+        // known dispatch call site's outBuf is worth remembering; anything else stashed here would
+        // just be dead weight CharAddHandItemDetour can never look up (its a1 only ever matches an
+        // outBuf from one of these specific call sites).
+        if (result && outBuf && IsWeaponDispatchRetAddr(returnAddr))
+            g_weaponDispatchOutBufDisplayId[outBuf] = displayId;
+
+        if (result && outBuf)
+        {
+            __try
+            {
+                auto* base = reinterpret_cast<const uint8_t*>(outBuf);
+                const char* model1 = *reinterpret_cast<char* const*>(base + offsets::itemdisplayinfo::kOffModel1);
+                const char* model2 = *reinterpret_cast<char* const*>(base + offsets::itemdisplayinfo::kOffModel2);
+                const char* tex1   = *reinterpret_cast<char* const*>(base + offsets::itemdisplayinfo::kOffTex1);
+                const char* tex2   = *reinterpret_cast<char* const*>(base + offsets::itemdisplayinfo::kOffTex2);
+                EquipLog("[DIAG seq=%u] ItemDisplayInfoLookup RESULT: displayId=%u model1='%s' "
+                         "model2='%s' tex1='%s' tex2='%s'", seq, displayId,
+                         model1 ? model1 : "(null)", model2 ? model2 : "(null)",
+                         tex1 ? tex1 : "(null)", tex2 ? tex2 : "(null)");
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                EquipLog("[DIAG seq=%u] ItemDisplayInfoLookup RESULT: displayId=%u "
+                         "(outBuf read faulted)", seq, displayId);
+            }
+        }
+        else
+        {
+            EquipLog("[DIAG seq=%u] ItemDisplayInfoLookup RESULT: displayId=%u NOT FOUND (result=0)",
+                     seq, displayId);
+        }
+
+        return result;
     }
     }
 
@@ -3143,13 +3399,23 @@ r.count = static_cast<uint16_t>(collN);
                               reinterpret_cast<void*>(&BuildBonePaletteDetour),
                               reinterpret_cast<void**>(&g_origBuildBonePalette),
                               WXL_HOOK_DEFAULT_PRIORITY) != 0;
-        // DIAGNOSTIC ONLY -- see CharAddHandItemDetour's own comment. Address is core's own
-        // wxl::offsets::game::m2::kCharAddHandItem, not the extension-local offsets::m2hooks table
-        // the two hooks above use.
-        ok &= api->HookAttach("wxl-equip-extension:CharAddHandItem",
-                              wxl::offsets::game::m2::kCharAddHandItem,
+        // DIAGNOSTIC ONLY -- see CharAddHandItemDetour's own comment. Was previously a raw
+        // api->HookAttach against wxl::offsets::game::m2::kCharAddHandItem, a core-private header
+        // this extension cannot actually #include (see WxlOffsets.hpp's own top-of-file comment on
+        // why the extension-local offsets table exists at all) -- that reference doesn't compile.
+        // "M2.CharAddHandItem" is registered in the core's own HookPoints.cpp table, so
+        // HookAttachByName reaches the same address without needing the raw value on this side at
+        // all, exactly like M2PerFrameUpdate/BuildBonePalette should eventually move to as well.
+        ok &= api->HookAttachByName("M2.CharAddHandItem",
                               reinterpret_cast<void*>(&CharAddHandItemDetour),
                               reinterpret_cast<void**>(&g_origCharAddHandItem),
+                              WXL_HOOK_DEFAULT_PRIORITY) != 0;
+        // DIAGNOSTIC ONLY -- see ItemDisplayInfoLookupDetour's own comment. "Db2.ItemDisplayInfo-
+        // Lookup" is also a named hook point in the core's own table (HookPoints.cpp), so this is
+        // HookAttachByName the same way, not a raw address.
+        ok &= api->HookAttachByName("Db2.ItemDisplayInfoLookup",
+                              reinterpret_cast<void*>(&ItemDisplayInfoLookupDetour),
+                              reinterpret_cast<void**>(&g_origItemDisplayLookup),
                               WXL_HOOK_DEFAULT_PRIORITY) != 0;
         if (!ok)
             api->Log(WXL_LOG_ERROR, "equip-extension", "M2Render: one or more hooks failed");

@@ -65,9 +65,12 @@ namespace wxl::scripts::weaponextension
     /**
      * @brief Looks up the already-baked offhand-mirror virtual .m2 path for (displayId, column), if
      *        WXLWeaponModels.csv's Model1OffhandPath/Model2OffhandPath supplied one for it. Baked
-     *        eagerly alongside the mainhand columns (see PreregisterSidecarWeapons) and lazily on
-     *        miss the same way (see WeaponLazyResolve) -- by the time anything could call this, the
-     *        answer is either already cached or the sidecar genuinely has nothing for this column.
+     *        lazily, on first actual offhand equip (see WeaponGetOffhandVirtualPath's own doc
+     *        comment in WeaponExtension.cpp for why it isn't eager-baked alongside the mainhand
+     *        columns) -- by the time anything could call this after that, the answer is either
+     *        already cached or the sidecar genuinely has nothing for this column. Bakes under its
+     *        own distinct virtual key, separate from the mainhand bake for the same displayId/
+     *        column -- the two can never collide or overwrite each other.
      * @param column 0 = Model1OffhandPath, 1 = Model2OffhandPath.
      * @return true and fills out/outSz if a baked offhand virtual path exists for this
      *         (displayId, column); false (out left untouched) if this weapon has no offhand-specific
@@ -75,4 +78,21 @@ namespace wxl::scripts::weaponextension
      *         ItemModelData.dbc's Model1/Model2 already names (the mainhand bake, unchanged).
      */
     bool WeaponGetOffhandVirtualPath(uint32_t displayId, uint32_t column, char* out, size_t outSz);
+
+    /**
+     * @brief Mainhand/ranged counterpart to WeaponGetOffhandVirtualPath -- looks up the already-
+     *        baked virtual .m2 path for (displayId, column) that ItemModelData.dbc's Model1/Model2
+     *        field is ALSO patched to at the data level for a baked entry (see PreregisterSidecar-
+     *        Weapons/BakeWeaponDisplay). Exposed here as well so the runtime attach point
+     *        (CharAddHandItemDetour, EquipExtension.cpp) can apply the same override directly to
+     *        the resolved record for every equip slot -- unifying mainhand, offhand, and ranged
+     *        onto one mechanism instead of leaving mainhand/ranged solely dependent on the static
+     *        dbc patch.
+     * @param column 0 = Model1Path, 1 = Model2Path.
+     * @return true and fills out/outSz if a baked virtual path exists for this (displayId, column);
+     *         false (out left untouched) if this displayId/column has nothing to bake (no texture
+     *         row or geoset filter -- see BakeWeaponDisplay's own doc comment), in which case the
+     *         caller should leave the already-resolved record untouched.
+     */
+    bool WeaponGetVirtualPath(uint32_t displayId, uint32_t column, char* out, size_t outSz);
 }
